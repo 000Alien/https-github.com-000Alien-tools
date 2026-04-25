@@ -1,0 +1,55 @@
+在Wireshark中筛选RTP数据流的方法
+在Wireshark中筛选和分析RTP(实时传输协议)数据流有以下几种方法：
+
+基本筛选方法
+使用显示过滤器：
+
+rtp
+这将显示所有RTP数据包
+
+筛选特定SSRC(同步源标识符)：
+
+rtp.ssrc == 0x12345678
+将0x12345678替换为你要查找的实际SSRC值
+
+筛选特定负载类型：
+
+rtp.p_type == 0  // G.711 μ-law
+rtp.p_type == 8  // G.711 A-law
+rtp.p_type == 18 // G.729
+高级筛选技巧
+结合UDP端口筛选：
+
+udp.port == 1234 && rtp
+筛选使用特定UDP端口的RTP流
+
+筛选特定方向的RTP流：
+
+ip.src == 192.168.1.100 && rtp
+筛选来自特定IP地址的RTP流
+
+筛选RTP事件(如DTMF)：
+
+rtp.p_type == 101  // DTMF事件
+使用Telephony菜单分析RTP流
+点击菜单栏的"Telephony" > "RTP" > "Show All Streams"
+
+在弹出的窗口中选择感兴趣的RTP流
+
+可以点击"Analyze"进行更详细的分析，包括抖动、延迟等统计信息
+
+提取RTP负载数据
+如果需要提取RTP负载进行进一步分析：
+
+选择目标RTP数据包
+
+右键点击 > "Decode As..."
+
+在"Transport"选项卡中选择"RTP"
+
+然后可以使用"File" > "Export Objects" > "RTP"来导出音频数据
+
+这些方法可以帮助你在Wireshark中有效地筛选和分析RTP数据流。
+
+
+pyinstaller --onefile --windowed --icon=app.ico --name "MyApp" main.py

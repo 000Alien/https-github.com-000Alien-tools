@@ -1,0 +1,176 @@
+import os
+import shutil
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+
+class FileSplitterApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("文件分割程序")
+        self.root.geometry("600x500")
+
+        # 变量
+        self.source_folder = tk.StringVar()
+        self.target_folder = tk.StringVar()
+        self.files_per_folder = tk.IntVar(value=1690)
+
+        self.setup_ui()
+
+    def setup_ui(self):
+        # 源文件夹选择
+        source_frame = ttk.Frame(self.root, padding="10")
+        source_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Label(source_frame, text="源文件夹:").grid(row=0, column=0, sticky=tk.W)
+        ttk.Entry(source_frame, textvariable=self.source_folder, width=50).grid(row=0, column=1, padx=5)
+        ttk.Button(source_frame, text="浏览...", command=self.browse_source).grid(row=0, column=2)
+
+        # 目标文件夹选择
+        target_frame = ttk.Frame(self.root, padding="10")
+        target_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Label(target_frame, text="目标文件夹:").grid(row=0, column=0, sticky=tk.W)
+        ttk.Entry(target_frame, textvariable=self.target_folder, width=50).grid(row=0, column=1, padx=5)
+        ttk.Button(target_frame, text="浏览...", command=self.browse_target).grid(row=0, column=2)
+
+        # 文件数量设置
+        count_frame = ttk.Frame(self.root, padding="10")
+        count_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Label(count_frame, text="每个子文件夹文件数:").grid(row=0, column=0, sticky=tk.W)
+        ttk.Entry(count_frame, textvariable=self.files_per_folder, width=10).grid(row=0, column=1, padx=5, sticky=tk.W)
+
+        # 进度条
+        progress_frame = ttk.Frame(self.root, padding="10")
+        progress_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        self.progress = ttk.Progressbar(progress_frame, mode='determinate')
+        self.progress.pack(fill=tk.X)
+
+        # 日志显示
+        log_frame = ttk.Frame(self.root, padding="10")
+        log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        self.log = tk.Text(log_frame, height=15)
+        scrollbar = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log.yview)
+        self.log.configure(yscrollcommand=scrollbar.set)
+
+        self.log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 按钮
+        button_frame = ttk.Frame(self.root, padding="10")
+        button_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Button(button_frame, text="开始分割", command=self.start_splitting).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="退出", command=self.root.quit).pack(side=tk.RIGHT, padx=5)
+
+        self.log_message("程序已启动，请选择源文件夹和目标文件夹")
+
+    def browse_source(self):
+        folder = filedialog.askdirectory(title="选择源文件夹")
+        if folder:
+            self.source_folder.set(folder)
+            self.log_message(f"已选择源文件夹: {folder}")
+
+    def browse_target(self):
+        folder = filedialog.askdirectory(title="选择目标文件夹")
+        if folder:
+            self.target_folder.set(folder)
+            self.log_message(f"已选择目标文件夹: {folder}")
+
+    def log_message(self, message):
+        self.log.insert(tk.END, message + "\n")
+        self.log.see(tk.END)
+        self.root.update_idletasks()
+
+    def start_splitting(self):
+        source = self.source_folder.get()
+        target = self.target_folder.get()
+
+        if not source or not target:
+            messagebox.showwarning("警告", "请先选择源文件夹和目标文件夹")
+            return
+
+        files_per_folder = self.files_per_folder.get()
+        if files_per_folder <= 0:
+            messagebox.showwarning("警告", "请输入有效的文件数量")
+            return
+
+        # 获取源文件夹中的所有文件
+        try:
+            all_files = [f for f in os.listdir(source) if os.path.isfile(os.path.join(source, f))]
+            all_files.sort()  # 按文件名排序
+        except Exception as e:
+            messagebox.showerror("错误", f"无法读取源文件夹: {str(e)}")
+            return
+
+        total_files = len(all_files)
+        if total_files == 0:
+            messagebox.showwarning("警告", "源文件夹中没有文件")
+            return
+
+        # 计算需要的子文件夹数量
+        num_folders = (total_files + files_per_folder - 1) // files_per_folder
+
+        self.log_message(f"开始处理: 共{total_files}个文件，将分割到{num_folders}个子文件夹中")
+        self.progress['maximum'] = total_files
+        self.progress['value'] = 0
+
+        # 创建子文件夹并移动文件
+        files_copied = 0
+        for folder_num in range(1, num_folders + 1):
+            folder_name = str(folder_num)
+            folder_path = os.path.join(target, folder_name)
+
+            if not os.path.exists(folder_path):
+                os.makedirs(folder_path)
+                self.log_message(f"创建子文件夹: {folder_name}")
+
+            # 计算当前文件夹应该包含的文件范围
+            start_index = (folder_num - 1) * files_per_folder
+            end_index = min(folder_num * files_per_folder, total_files)
+
+            for i in range(start_index, end_index):
+                src_file = os.path.join(source, all_files[i])
+                dst_file = os.path.join(folder_path, all_files[i])
+
+                try:
+                    shutil.copy2(src_file, dst_file)  # 使用copy2保留元数据
+                    files_copied += 1
+                    self.progress['value'] = files_copied
+
+                    if files_copied % 100 == 0:
+                        self.log_message(f"已处理 {files_copied}/{total_files} 个文件")
+                        self.root.update_idletasks()
+
+                except Exception as e:
+                    self.log_message(f"错误: 无法复制文件 {all_files[i]}: {str(e)}")
+
+        # 验证结果
+        self.log_message("处理完成，正在验证结果...")
+        total_copied = 0
+        for folder_num in range(1, num_folders + 1):
+            folder_name = str(folder_num)
+            folder_path = os.path.join(target, folder_name)
+
+            if os.path.exists(folder_path):
+                files_in_folder = [f for f in os.listdir(folder_path) if os.path.isfile(os.path.join(folder_path, f))]
+                total_copied += len(files_in_folder)
+                self.log_message(f"子文件夹 {folder_name} 中有 {len(files_in_folder)} 个文件")
+
+        if total_copied == total_files:
+            self.log_message(f"验证成功! 总共复制了 {total_copied} 个文件")
+            messagebox.showinfo("完成", f"文件分割完成! 总共处理了 {total_copied} 个文件")
+        else:
+            self.log_message(
+                f"警告: 复制文件数量不匹配。源文件夹有 {total_files} 个文件，但只复制了 {total_copied} 个文件")
+            messagebox.showwarning("警告",
+                                   f"复制文件数量不匹配。源文件夹有 {total_files} 个文件，但只复制了 {total_copied} 个文件")
+
+
+if __name__ == '__main__':
+    root = tk.Tk()
+    app = FileSplitterApp(root)
+    root.mainloop()
