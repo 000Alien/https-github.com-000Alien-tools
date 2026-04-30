@@ -1,4 +1,4 @@
-#streamlit run V3.py
+#streamlit run V4.py
 import streamlit as st
 import pandas as pd
 import requests
@@ -156,7 +156,7 @@ def download_fund_individual_holdings():
                 st.warning("请输入基金代码")
 
 
-# ========================== 1. 爬取高涨幅基金 ==========================
+# ========================== 1. 爬取高涨幅基金（增加下载功能）==========================
 def crawl_high_return_funds():
     funds = []
     progress_bar = st.progress(0)
@@ -216,13 +216,60 @@ def crawl_high_return_funds():
 
     df = pd.DataFrame(funds)
     st.session_state.high_funds = df
+    
     if not df.empty:
         st.success(f"✅ 爬取完成！共找到 **{len(df)}** 只基金")
-        st.dataframe(df.head(20), use_container_width=True, hide_index=True)
-
-        # 添加下载按钮
-        st.markdown("### 💾 下载基金列表")
-        create_download_buttons(df, "高涨幅基金列表")
+        
+        # 显示数据表格
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        
+        # ========== 新增：更明显的下载区域 ==========
+        st.markdown("---")
+        st.subheader("💾 下载高涨幅基金列表")
+        
+        # 创建三列布局，让下载按钮更明显
+        col_download1, col_download2, col_download3 = st.columns(3)
+        
+        with col_download1:
+            # CSV 下载
+            csv_data = convert_df_to_csv(df, "高涨幅基金列表")
+            if csv_data:
+                st.download_button(
+                    label="📥 下载 CSV 格式",
+                    data=csv_data,
+                    file_name=f"高涨幅基金列表_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    key="high_funds_csv"
+                )
+        
+        with col_download2:
+            # Excel 下载
+            excel_data = convert_df_to_excel(df, "高涨幅基金列表")
+            if excel_data:
+                st.download_button(
+                    label="📊 下载 Excel 格式",
+                    data=excel_data,
+                    file_name=f"高涨幅基金列表_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    key="high_funds_excel"
+                )
+        
+        with col_download3:
+            # 显示统计信息
+            st.metric("📊 基金数量", len(df))
+            st.metric("📈 平均涨幅", f"{df['近一年涨幅(%)'].mean():.1f}%")
+        
+        # 额外：显示前20只基金代码，方便复制
+        with st.expander("📋 查看基金代码列表（可复制）"):
+            codes = df['基金代码'].tolist()
+            st.code(", ".join(codes), language="text")
+            st.info(f"共 {len(codes)} 只基金代码，可复制后用于批量获取持仓")
+            
+    else:
+        st.warning("未找到符合条件的高涨幅基金，请尝试降低阈值或增加爬取页数")
+    
     return df
 
 
@@ -705,4 +752,4 @@ if not st.session_state.stock_scores.empty:
         st.markdown("**💾 下载当前数据**")
         create_download_buttons(st.session_state.stock_scores[cols].head(TOP_N_STOCKS), "龙头股排行")
 
-st.caption("✅ 已完全修复JSON解析错误 | 支持双引号属性名处理 | 支持CSV/Excel下载 | 支持单只基金下载")
+st.caption("✅ 已完全修复JSON解析错误 | 支持双引号属性名处理 | 支持CSV/Excel下载 | 支持单只基金下载 | 高涨幅基金支持下载")
