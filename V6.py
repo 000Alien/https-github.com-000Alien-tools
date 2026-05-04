@@ -42,7 +42,7 @@ def create_retry_session():
 # ========================== 配置 ==========================
 st.set_page_config(page_title="A股最强主线龙头股识别系统", page_icon="🐉", layout="wide")
 st.title("🐉 A股最强主线 & 龙头股识别系统")
-st.markdown("**持仓解析最终版 V6**：支持防刷新缓存 | 断点续爬 | 数据持久化")
+st.markdown("**持仓解析最终版 V6**：支持自定义爬取周期 | 防刷新缓存 | 数据持久化")
 
 # 初始化会话状态（增强版）
 default_state = {
@@ -77,13 +77,25 @@ period_type = st.sidebar.selectbox(
     index=3
 )
 
-period_map = {
+# 周期映射（东方财富网排序字段）
+period_sort_map = {
     "近1个月": "1m",
     "近3个月": "3m",
     "近6个月": "6m",
     "近1年": "1nzf",
     "近2年": "2nzf",
     "近3年": "3nzf",
+}
+
+# 涨幅字段位置映射（不同周期在返回数据中的字段索引）
+# 东方财富网返回字段顺序：代码,名称,净值,日涨幅,近1周,近1月,近3月,近6月,近1年,近2年,近3年,今年来,成立来,...
+period_field_map = {
+    "近1个月": 5,   # 第6个字段
+    "近3个月": 6,   # 第7个字段
+    "近6个月": 7,   # 第8个字段
+    "近1年": 8,     # 第9个字段
+    "近2年": 9,     # 第10个字段
+    "近3年": 10,    # 第11个字段
 }
 
 if period_type == "自定义":
@@ -101,7 +113,6 @@ if period_type == "自定义":
 else:
     start_date = None
     end_date = None
-    selected_period = period_map.get(period_type, "1nzf")
 
 USE_AKSHARE = st.sidebar.checkbox("优先使用 AKShare", value=True)
 
@@ -156,7 +167,7 @@ def create_download_buttons(df, title_prefix, key_prefix=""):
             )
 
 
-# ========================== 1. 爬取高涨幅基金（增强版：防刷新+断点续爬）==========================
+# ========================== 1. 爬取高涨幅基金（修复周期选择）==========================
 def crawl_high_return_funds(reset=False):
     """爬取高涨幅基金，支持断点续爬和防刷新"""
     
@@ -164,6 +175,8 @@ def crawl_high_return_funds(reset=False):
     if reset:
         st.session_state.crawl_progress = {'current_page': 1, 'total_funds': 0, 'is_running': False}
         st.session_state.high_funds = pd.DataFrame()
+        st.session_state.cache_key = None
+        st.session_state.last_crawl_time = None
     
     # 如果正在运行中，提示用户
     if st.session_state.crawl_progress.get('is_running', False):
@@ -171,9 +184,20 @@ def crawl_high_return_funds(reset=False):
         return st.session_state.high_funds
     
     # 生成缓存键
-    cache_key = f"{period_type}_{start_date}_{end_date}_{RETURN_THRESHOLD}"
+    if period_type == "自定义":
+        cache_key = f"custom_{start_date}_{end_date}_{RETURN_THRESHOLD}"
+        period_display = f"{start_date} 至 {end_date}"
+        col_name = f'{start_date}至{end_date}涨幅(%)'
+        sort_field = "zdf"
+        ret_field_index = 6  # 自定义区间涨幅字段位置
+    else:
+        cache_key = f"{period_type}_{RETURN_THRESHOLD}"
+        period_display = period_type
+        col_name = f'{period_type}涨幅(%)'
+        sort_field = period_sort_map.get(period_type, "1nzf")
+        ret_field_index = period_field_map.get(period_type, 8)
     
-    # 检查缓存（如果参数没变且已有数据，直接返回）
+    # 检查缓存
     if (not reset and not st.session_state.high_funds.empty and 
         st.session_state.get('cache_key') == cache_key):
         st.info(f"📦 使用缓存数据（上次爬取时间：{st.session_state.last_crawl_time}）")
@@ -184,12 +208,8 @@ def crawl_high_return_funds(reset=False):
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    # 显示当前选择的周期
-    if period_type == "自定义":
-        period_display = f"{start_date} 至 {end_date}"
-        st.info(f"🚀 开始爬取 {period_display} 期间涨幅 ≥ {RETURN_THRESHOLD}% 的基金...")
-    else:
-        st.info(f"🚀 开始爬取{period_type}涨幅 ≥ {RETURN_THRESHOLD}% 的基金...")
+    st.info(f"🚀 开始爬取{period_display}涨幅 ≥ {RETURN_THRESHOLD}% 的基金...")
+    st.info(f"📊 排序字段: {sort_field}, 涨幅字段位置: 第{ret_field_index + 1}个")
     
     # 标记运行状态
     st.session_state.crawl_progress['is_running'] = True
@@ -197,16 +217,16 @@ def crawl_high_return_funds(reset=False):
     page = 1
     session = create_retry_session()
     
-    # 使用 spinner 防止页面刷新中断
-    with st.spinner("数据爬取中，请勿刷新页面..."):
+    with st.spinner(f"正在爬取{period_display}数据，请勿刷新页面..."):
         while page <= MAX_PAGES:
-            # 根据选择的周期构建 URL
+            # 构建 URL
             if period_type == "自定义" and start_date and end_date:
                 sd = start_date.strftime('%Y-%m-%d')
                 ed = end_date.strftime('%Y-%m-%d')
                 url = f"http://fund.eastmoney.com/data/rankhandler.aspx?op=ph&dt=kf&ft=all&sc=zdf&st=desc&sd={sd}&ed={ed}&pi={page}&pn=100&v={random.random()}"
             else:
-                url = f"http://fund.eastmoney.com/data/rankhandler.aspx?op=ph&dt=kf&ft=all&sc={selected_period}&st=desc&sd={(datetime.now() - timedelta(days=400)).strftime('%Y-%m-%d')}&ed={datetime.now().strftime('%Y-%m-%d')}&pi={page}&pn=100&v={random.random()}"
+                # 使用选择的周期对应的排序字段
+                url = f"http://fund.eastmoney.com/data/rankhandler.aspx?op=ph&dt=kf&ft=all&sc={sort_field}&st=desc&pi={page}&pn=100&v={random.random()}"
             
             try:
                 resp = session.get(url, timeout=15)
@@ -230,22 +250,20 @@ def crawl_high_return_funds(reset=False):
                 for item in datas:
                     if isinstance(item, str):
                         fields = [x.strip() for x in item.split(',')]
-                        if len(fields) < 12:
+                        if len(fields) <= ret_field_index:
                             continue
                         try:
-                            if period_type == "自定义":
-                                ret = float(fields[6].replace('%', '').strip()) if len(fields) > 6 else 0
-                            else:
-                                ret = float(fields[11].replace('%', '').strip()) if len(fields) > 11 else 0
+                            # 根据选择的周期读取对应的涨幅字段
+                            ret_str = fields[ret_field_index].replace('%', '').strip()
+                            ret = float(ret_str) if ret_str else 0
                             
                             if ret >= RETURN_THRESHOLD:
-                                col_name = f'{period_type}涨幅(%)' if period_type != "自定义" else f'{start_date}至{end_date}涨幅(%)'
                                 funds.append({
                                     '基金代码': fields[0],
                                     '基金名称': fields[1],
                                     col_name: round(ret, 2)
                                 })
-                        except:
+                        except (ValueError, IndexError) as e:
                             continue
                 
                 progress = min(int(page / MAX_PAGES * 100), 100)
@@ -265,7 +283,6 @@ def crawl_high_return_funds(reset=False):
                 page += 1
                 continue
     
-    # 爬取完成，标记结束
     st.session_state.crawl_progress['is_running'] = False
     st.session_state.last_crawl_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     st.session_state.cache_key = cache_key
@@ -274,7 +291,7 @@ def crawl_high_return_funds(reset=False):
     st.session_state.high_funds = df
     
     if not df.empty:
-        st.success(f"✅ 爬取完成！共找到 **{len(df)}** 只基金")
+        st.success(f"✅ 爬取完成！共找到 **{len(df)}** 只基金（{period_display}涨幅 ≥ {RETURN_THRESHOLD}%）")
         st.dataframe(df, use_container_width=True, hide_index=True)
         st.markdown("**💾 下载高涨幅基金列表**")
         create_download_buttons(df, "高涨幅基金列表", "crawl")
@@ -294,7 +311,7 @@ def crawl_high_return_funds(reset=False):
             max_return = df.iloc[:, 2].max() if len(df.columns) > 2 else 0
             st.metric("最大涨幅", f"{max_return:.1f}%")
     else:
-        st.warning("未找到符合条件的高涨幅基金，请尝试降低阈值、扩大周期或增加爬取页数")
+        st.warning(f"未找到符合条件的基金（{period_display}涨幅 ≥ {RETURN_THRESHOLD}%）")
     
     return df
 
@@ -405,7 +422,7 @@ def get_fund_holdings(fund_code: str, fund_name: str):
     return pd.DataFrame()
 
 
-# ========================== 批量获取（增强版） ==========================
+# ========================== 批量获取 ==========================
 def crawl_all_holdings_from_list(fund_list_df):
     if fund_list_df.empty or '基金代码' not in fund_list_df.columns:
         st.error("必须包含 '基金代码' 列")
@@ -418,7 +435,6 @@ def crawl_all_holdings_from_list(fund_list_df):
     total = len(fund_list_df)
     st.info(f"准备处理 {total} 只基金")
     
-    # 使用 spinner 防止中断
     with st.spinner(f"正在获取 {total} 只基金持仓，请勿刷新页面..."):
         for i, row in fund_list_df.iterrows():
             code = str(row['基金代码']).strip().zfill(6)
@@ -501,21 +517,26 @@ st.divider()
 st.header("🚀 核心功能")
 
 # 显示当前爬取周期和缓存状态
-col_period1, col_period2, col_period3 = st.columns(3)
+col_period1, col_period2, col_period3, col_period4 = st.columns(4)
 with col_period1:
     if period_type == "自定义":
-        st.info(f"📅 当前周期：{start_date} 至 {end_date}")
+        st.info(f"📅 周期：{start_date} 至 {end_date}")
     else:
-        st.info(f"📅 当前周期：{period_type}")
+        st.info(f"📅 周期：{period_type}")
 with col_period2:
-    st.info(f"📊 涨幅阈值：≥ {RETURN_THRESHOLD}%")
+    st.info(f"📊 阈值：≥ {RETURN_THRESHOLD}%")
 with col_period3:
+    if period_type != "自定义":
+        st.info(f"📍 字段位置：第{period_field_map.get(period_type, 8) + 1}个")
+    else:
+        st.info(f"📍 模式：自定义区间")
+with col_period4:
     if st.session_state.last_crawl_time:
-        st.info(f"💾 缓存时间：{st.session_state.last_crawl_time}")
+        st.info(f"💾 缓存：{st.session_state.last_crawl_time}")
     else:
         st.info(f"💾 状态：未缓存")
 
-# 三个主要功能按钮
+# 四个主要功能按钮
 col1, col2, col3, col4 = st.columns(4)
 with col1:
     if st.button("1️⃣ 爬取高涨幅基金", type="primary", use_container_width=True):
@@ -543,6 +564,7 @@ with col_clear1:
         st.session_state.high_funds = pd.DataFrame()
         st.session_state.crawl_progress = {'current_page': 1, 'total_funds': 0, 'is_running': False}
         st.session_state.last_crawl_time = None
+        st.session_state.cache_key = None
         st.success("已清空")
 with col_clear2:
     if st.button("清空持仓明细", use_container_width=True):
@@ -616,4 +638,4 @@ if not st.session_state.stock_scores.empty:
         st.dataframe(st.session_state.stock_scores[cols].head(TOP_N_STOCKS), use_container_width=True, hide_index=True)
         create_download_buttons(st.session_state.stock_scores[cols].head(TOP_N_STOCKS), "龙头股排行", "show_score")
 
-st.caption("✅ V6 增强版 | 支持防刷新缓存 | 断点续爬 | 数据持久化 | 支持自定义爬取周期")
+st.caption("✅ V6 增强版 | 修复周期选择问题 | 支持近1月/3月/6月/1年/2年/3年/自定义 | 防刷新缓存 | 数据持久化")
