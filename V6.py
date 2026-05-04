@@ -44,7 +44,7 @@ st.set_page_config(page_title="A股最强主线龙头股识别系统", page_icon
 st.title("🐉 A股最强主线 & 龙头股识别系统")
 st.markdown("**持仓解析最终版 V6**：支持自定义爬取周期 | 防刷新缓存 | 数据持久化")
 
-# 初始化会话状态（增强版）
+# 初始化会话状态
 default_state = {
     'high_funds': pd.DataFrame(),
     'all_holdings': pd.DataFrame(),
@@ -73,29 +73,21 @@ st.sidebar.header("📅 爬取周期设置")
 
 period_type = st.sidebar.selectbox(
     "涨幅统计周期",
-    options=["近1个月", "近3个月", "近6个月", "近1年", "近2年", "近3年", "自定义"],
-    index=3
+    options=["近1周", "近1个月", "近3个月", "近6个月", "近1年", "近2年", "近3年", "今年来", "成立来", "自定义"],
+    index=4  # 默认近1年
 )
 
-# 周期映射（东方财富网排序字段）
+# 东方财富网排序字段映射
 period_sort_map = {
+    "近1周": "1w",
     "近1个月": "1m",
     "近3个月": "3m",
     "近6个月": "6m",
     "近1年": "1nzf",
     "近2年": "2nzf",
     "近3年": "3nzf",
-}
-
-# 涨幅字段位置映射（不同周期在返回数据中的字段索引）
-# 东方财富网返回字段顺序：代码,名称,净值,日涨幅,近1周,近1月,近3月,近6月,近1年,近2年,近3年,今年来,成立来,...
-period_field_map = {
-    "近1个月": 5,   # 第6个字段
-    "近3个月": 6,   # 第7个字段
-    "近6个月": 7,   # 第8个字段
-    "近1年": 8,     # 第9个字段
-    "近2年": 9,     # 第10个字段
-    "近3年": 10,    # 第11个字段
+    "今年来": "jnzf",
+    "成立来": "clnf",
 }
 
 if period_type == "自定义":
@@ -167,7 +159,18 @@ def create_download_buttons(df, title_prefix, key_prefix=""):
             )
 
 
-# ========================== 1. 爬取高涨幅基金（修复周期选择）==========================
+# ========================== 调试函数：查看返回的数据结构 ==========================
+def debug_response_data(text):
+    """调试函数：查看返回的数据结构"""
+    match = re.search(r'var\s+rankData\s*=\s*(\{.*?\});', text, re.DOTALL | re.IGNORECASE)
+    if match:
+        data_str = match.group(1)
+        # 只取前500字符用于调试
+        return data_str[:500]
+    return None
+
+
+# ========================== 1. 爬取高涨幅基金（修复版）==========================
 def crawl_high_return_funds(reset=False):
     """爬取高涨幅基金，支持断点续爬和防刷新"""
     
@@ -188,14 +191,10 @@ def crawl_high_return_funds(reset=False):
         cache_key = f"custom_{start_date}_{end_date}_{RETURN_THRESHOLD}"
         period_display = f"{start_date} 至 {end_date}"
         col_name = f'{start_date}至{end_date}涨幅(%)'
-        sort_field = "zdf"
-        ret_field_index = 6  # 自定义区间涨幅字段位置
     else:
         cache_key = f"{period_type}_{RETURN_THRESHOLD}"
         period_display = period_type
         col_name = f'{period_type}涨幅(%)'
-        sort_field = period_sort_map.get(period_type, "1nzf")
-        ret_field_index = period_field_map.get(period_type, 8)
     
     # 检查缓存
     if (not reset and not st.session_state.high_funds.empty and 
@@ -209,13 +208,13 @@ def crawl_high_return_funds(reset=False):
     status_text = st.empty()
     
     st.info(f"🚀 开始爬取{period_display}涨幅 ≥ {RETURN_THRESHOLD}% 的基金...")
-    st.info(f"📊 排序字段: {sort_field}, 涨幅字段位置: 第{ret_field_index + 1}个")
     
     # 标记运行状态
     st.session_state.crawl_progress['is_running'] = True
     
     page = 1
     session = create_retry_session()
+    first_page_data = None  # 用于调试
     
     with st.spinner(f"正在爬取{period_display}数据，请勿刷新页面..."):
         while page <= MAX_PAGES:
@@ -225,7 +224,7 @@ def crawl_high_return_funds(reset=False):
                 ed = end_date.strftime('%Y-%m-%d')
                 url = f"http://fund.eastmoney.com/data/rankhandler.aspx?op=ph&dt=kf&ft=all&sc=zdf&st=desc&sd={sd}&ed={ed}&pi={page}&pn=100&v={random.random()}"
             else:
-                # 使用选择的周期对应的排序字段
+                sort_field = period_sort_map.get(period_type, "1nzf")
                 url = f"http://fund.eastmoney.com/data/rankhandler.aspx?op=ph&dt=kf&ft=all&sc={sort_field}&st=desc&pi={page}&pn=100&v={random.random()}"
             
             try:
@@ -233,35 +232,100 @@ def crawl_high_return_funds(reset=False):
                 resp.raise_for_status()
                 text = resp.text
                 
+                # 保存第一页数据用于调试
+                if page == 1 and first_page_data is None:
+                    first_page_data = text
+                
+                # 解析数据
                 match = re.search(r'var\s+rankData\s*=\s*(\{.*?\});', text, re.DOTALL | re.IGNORECASE)
                 if not match:
+                    st.warning(f"第 {page} 页：未找到 rankData")
                     break
                 
-                data_str = re.sub(r'([a-zA-Z_]\w*)\s*:', r'"\1":', match.group(1))
-                data = json.loads(data_str) if '{' in data_str else eval(data_str)
+                data_str = match.group(1)
                 
+                # 尝试多种解析方式
+                data = None
+                try:
+                    # 方式1：正则添加引号后解析
+                    fixed_str = re.sub(r'([a-zA-Z_]\w*)\s*:', r'"\1":', data_str)
+                    data = json.loads(fixed_str)
+                except:
+                    pass
+                
+                if data is None:
+                    try:
+                        # 方式2：demjson3
+                        data = demjson3.decode(data_str)
+                    except:
+                        pass
+                
+                if data is None:
+                    try:
+                        # 方式3：eval
+                        data_str_fixed = data_str.replace('null', 'None').replace('true', 'True').replace('false', 'False')
+                        data = eval(data_str_fixed)
+                    except:
+                        pass
+                
+                if data is None:
+                    st.warning(f"第 {page} 页：数据解析失败")
+                    break
+                
+                # 获取 datas 数组
                 datas = data.get('datas') or data.get('data') or []
                 if not datas:
+                    st.warning(f"第 {page} 页：无数据")
                     break
                 
-                total_pages = data.get('allPages') or data.get('allNum') or data.get('pages') or data.get(
-                    'pageNum') or MAX_PAGES
+                total_pages = data.get('allPages') or data.get('allNum') or data.get('pages') or MAX_PAGES
                 
+                # 解析每一条数据
                 for item in datas:
                     if isinstance(item, str):
                         fields = [x.strip() for x in item.split(',')]
-                        if len(fields) <= ret_field_index:
+                        if len(fields) < 8:
                             continue
+                        
+                        # 东方财富网返回字段顺序（验证后）：
+                        # 0: 基金代码, 1: 基金名称, 2: 净值, 3: 日涨幅, 
+                        # 4: 近1周, 5: 近1月, 6: 近3月, 7: 近6月, 
+                        # 8: 近1年, 9: 近2年, 10: 近3年, 11: 今年来, 12: 成立来
+                        
+                        # 根据周期类型选择对应的涨幅字段
+                        field_index_map = {
+                            "近1周": 4,
+                            "近1个月": 5,
+                            "近3个月": 6,
+                            "近6个月": 7,
+                            "近1年": 8,
+                            "近2年": 9,
+                            "近3年": 10,
+                            "今年来": 11,
+                            "成立来": 12,
+                        }
+                        
+                        if period_type == "自定义":
+                            # 自定义周期使用的是区间涨幅，字段位置可能不同
+                            # 自定义返回的数据中，涨幅可能在字段6
+                            ret_index = 6
+                        else:
+                            ret_index = field_index_map.get(period_type, 8)
+                        
+                        if len(fields) <= ret_index:
+                            continue
+                        
                         try:
-                            # 根据选择的周期读取对应的涨幅字段
-                            ret_str = fields[ret_field_index].replace('%', '').strip()
+                            ret_str = fields[ret_index].replace('%', '').strip()
                             ret = float(ret_str) if ret_str else 0
                             
                             if ret >= RETURN_THRESHOLD:
                                 funds.append({
                                     '基金代码': fields[0],
                                     '基金名称': fields[1],
-                                    col_name: round(ret, 2)
+                                    col_name: round(ret, 2),
+                                    '净值': fields[2] if len(fields) > 2 else '',
+                                    '日涨幅': fields[3] if len(fields) > 3 else ''
                                 })
                         except (ValueError, IndexError) as e:
                             continue
@@ -278,8 +342,9 @@ def crawl_high_return_funds(reset=False):
                     break
                 page += 1
                 time.sleep(random.uniform(DELAY_MIN, DELAY_MIN + 1.0))
+                
             except Exception as e:
-                st.warning(f"第 {page} 页请求失败: {str(e)[:50]}，继续下一页...")
+                st.error(f"第 {page} 页请求失败: {str(e)}")
                 page += 1
                 continue
     
@@ -292,7 +357,11 @@ def crawl_high_return_funds(reset=False):
     
     if not df.empty:
         st.success(f"✅ 爬取完成！共找到 **{len(df)}** 只基金（{period_display}涨幅 ≥ {RETURN_THRESHOLD}%）")
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        
+        # 显示简化的表格
+        display_df = df[['基金代码', '基金名称', col_name]]
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+        
         st.markdown("**💾 下载高涨幅基金列表**")
         create_download_buttons(df, "高涨幅基金列表", "crawl")
         
@@ -305,13 +374,24 @@ def crawl_high_return_funds(reset=False):
         with col_stat1:
             st.metric("基金数量", len(df))
         with col_stat2:
-            avg_return = df.iloc[:, 2].mean() if len(df.columns) > 2 else 0
+            avg_return = df[col_name].mean()
             st.metric("平均涨幅", f"{avg_return:.1f}%")
         with col_stat3:
-            max_return = df.iloc[:, 2].max() if len(df.columns) > 2 else 0
+            max_return = df[col_name].max()
             st.metric("最大涨幅", f"{max_return:.1f}%")
     else:
         st.warning(f"未找到符合条件的基金（{period_display}涨幅 ≥ {RETURN_THRESHOLD}%）")
+        
+        # 显示调试信息
+        with st.expander("🔧 调试信息", expanded=True):
+            st.info("可能原因：")
+            st.write("1. 涨幅阈值设置过高")
+            st.write("2. 选择的周期内没有符合条件的基金")
+            st.write("3. 数据接口字段位置需要调整")
+            
+            if first_page_data:
+                st.text("第一页数据预览（前800字符）：")
+                st.code(first_page_data[:800], language="javascript")
     
     return df
 
@@ -517,7 +597,7 @@ st.divider()
 st.header("🚀 核心功能")
 
 # 显示当前爬取周期和缓存状态
-col_period1, col_period2, col_period3, col_period4 = st.columns(4)
+col_period1, col_period2, col_period3 = st.columns(3)
 with col_period1:
     if period_type == "自定义":
         st.info(f"📅 周期：{start_date} 至 {end_date}")
@@ -526,11 +606,6 @@ with col_period1:
 with col_period2:
     st.info(f"📊 阈值：≥ {RETURN_THRESHOLD}%")
 with col_period3:
-    if period_type != "自定义":
-        st.info(f"📍 字段位置：第{period_field_map.get(period_type, 8) + 1}个")
-    else:
-        st.info(f"📍 模式：自定义区间")
-with col_period4:
     if st.session_state.last_crawl_time:
         st.info(f"💾 缓存：{st.session_state.last_crawl_time}")
     else:
@@ -638,4 +713,4 @@ if not st.session_state.stock_scores.empty:
         st.dataframe(st.session_state.stock_scores[cols].head(TOP_N_STOCKS), use_container_width=True, hide_index=True)
         create_download_buttons(st.session_state.stock_scores[cols].head(TOP_N_STOCKS), "龙头股排行", "show_score")
 
-st.caption("✅ V6 增强版 | 修复周期选择问题 | 支持近1月/3月/6月/1年/2年/3年/自定义 | 防刷新缓存 | 数据持久化")
+st.caption("✅ V6 增强版 | 修复周期选择问题 | 支持近1周/1月/3月/6月/1年/2年/3年/今年来/成立来/自定义 | 防刷新缓存")
