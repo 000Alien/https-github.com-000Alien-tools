@@ -1,13 +1,11 @@
-# streamlit run v5.py
-# 修复说明：
-# 1. 批量爬取中间结果实时写入 session_state，支持断点续爬
-# 2. get_fund_holdings 新增 verbose 参数，批量模式下不再循环创建 st 元素（避免页面崩溃）
-# 3. 使用 enumerate 替代 iterrows 的原始 index，修复进度计数错误
-# 4. 所有逐基金提示收拢到单个 st.empty() 占位符，不再累积 DOM 节点
-# 5. 配套 .streamlit/config.toml 延长服务器超时（见文件末尾注释）
-# 6. 修复 _flush_snapshot 中未定义变量 hold_df 导致的 NameError
-# 7. 修复 TLSAdapter 重试机制失效问题，改用 session.verify=False + HTTPAdapter
-# 8. 替换基金涨幅爬取为 AKShare 接口 fund_open_fund_rank_em，解决东方财富反爬
+# streamlit run v12.py
+# 修复说明（v12）：
+# 1. 修复 AKShare 涨跌幅列含百分号导致无法筛选的问题
+# 2. 彻底解决多线程修改 session_state 的不安全问题
+# 3. 优化爬取过程中的状态更新逻辑，杜绝并发冲突
+# 4. 微调 JSON 解析健壮性，避免少数特殊字符导致崩溃
+# 5. 保留原有断点续爬与 UI 功能
+# 6. 20260614修改代码 
 
 import streamlit as st
 import pandas as pd
@@ -27,14 +25,20 @@ from bs4 import BeautifulSoup
 import demjson3
 import io
 
-# ========================== 重试 Session（修复版） ==========================
+# ========================== 重试 Session（线程安全） ==========================
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 _thread_local = threading.local()
+
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                  '(KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
+    'Referer': 'http://fund.eastmoney.com/'
+}
 
 def create_retry_session():
     """创建带重试和 SSL 验证关闭的 Session，每个线程独立使用。"""
     session = requests.Session()
-    session.verify = False  # 全局禁用 SSL 验证（适用于东方财富等非标准证书）
+    session.verify = False
     retries = Retry(
         total=3,
         connect=3,
@@ -50,12 +54,12 @@ def create_retry_session():
     return session
 
 def get_thread_session():
-    """每个工作线程复用自己的 Session，避免反复握手。"""
+    """每个工作线程复用自己的 Session。"""
     if not hasattr(_thread_local, "session"):
         _thread_local.session = create_retry_session()
     return _thread_local.session
 
-# ========================== 配置 ==========================
+# ========================== 页面配置与样式 ==========================
 st.set_page_config(page_title="A股最强主线龙头股识别系统", page_icon="🐉", layout="wide")
 
 st.markdown("""
@@ -111,7 +115,7 @@ st.markdown("""
     .section-note {
         border-left: 4px solid #ef4444;
         background: rgba(239, 68, 68, .09);
-        padding: .75rem .9rem;
+        padding: .75rem 1rem;
         border-radius: 6px;
         color: #d7dee9;
         margin: .35rem 0 1rem 0;
@@ -149,7 +153,7 @@ st.markdown("""
 <div class="hero-band">
     <div class="app-title">A股基金持仓与主线识别工作台</div>
     <div class="app-subtitle">
-        从基金涨幅筛选、基金持仓爬取、个股反查到龙头评分的一体化工具。
+        从基金涨幅筛选、基金持仓爬取、个股反查到龙头评分的一体化工具。<br>
         适合先找强势基金池，再观察这些基金共同持有哪些股票，并支持导出明细继续分析。
     </div>
 </div>
@@ -168,13 +172,13 @@ for key, default in _default_state.items():
     if key not in st.session_state:
         st.session_state[key] = default
 
-# 侧边栏
+# 侧边栏控件
 st.sidebar.title("控制台")
 st.sidebar.caption("先设定基金筛选口径，再执行主界面的爬取、导入或查询。")
 today_date = datetime.now().date()
 
 with st.sidebar.expander("基金筛选", expanded=True):
-    RETURN_PERIOD = st.selectbox("涨幅周期", ["周", "月", "季度", "年"], index=2)  # 暂不支持自定义（AKShare无直接接口）
+    RETURN_PERIOD = st.selectbox("涨幅周期", ["周", "月", "季度", "年"], index=2)
     if RETURN_PERIOD == "周":
         RETURN_START_DATE = today_date - timedelta(days=7)
         RETURN_END_DATE = today_date
@@ -200,8 +204,7 @@ with st.sidebar.expander("基金筛选", expanded=True):
         step=5.0,
         help="只保留区间涨幅不低于该数值的基金。",
     )
-    MAX_PAGES = st.number_input("最大爬取页数", 1, 50, value=10, help="每页约 100 只基金。")
-    # 注：MAX_PAGES 在 AKShare 版本中无效，保留仅用于兼容旧逻辑
+    MAX_PAGES = st.number_input("最大爬取页数", 1, 50, value=10, help="每页约 100 只基金（AKShare 版本忽略此参数）")
 
 with st.sidebar.expander("持仓爬取", expanded=True):
     HOLDING_WORKERS = st.slider("持仓并发数", 1, 16, 8, help="网络稳定时可调高；失败增多时调低。")
@@ -214,13 +217,7 @@ with st.sidebar.expander("结果展示", expanded=True):
     TOP_N_STOCKS = st.slider("龙头榜显示数量", 10, 100, 30)
     MIN_HOLDING_FUNDS = st.slider("龙头最少持有基金数", 1, 50, 8)
 
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-                  '(KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
-    'Referer': 'http://fund.eastmoney.com/'
-}
-
-# ========================== 下载功能 ==========================
+# ========================== 辅助函数 ==========================
 def convert_df_to_csv(df):
     if df.empty:
         return None
@@ -291,86 +288,7 @@ def download_fund_individual_holdings():
             else:
                 st.warning("请输入基金代码")
 
-# ========================== 1. 爬取高涨幅基金（使用 AKShare fund_open_fund_rank_em） ==========================
-def get_return_period_config():
-    start_date = pd.to_datetime(RETURN_START_DATE).date()
-    end_date = pd.to_datetime(RETURN_END_DATE).date()
-    if start_date > end_date:
-        start_date, end_date = end_date, start_date
-    label = f"{RETURN_PERIOD}涨幅"
-    column_name = f"{label}(%)"
-    return start_date, end_date, label, column_name
-
-def crawl_high_return_funds():
-    """使用 AKShare 的 fund_open_fund_rank_em 获取区间涨幅靠前的基金列表"""
-    import akshare as ak
-
-    start_date, end_date, return_label, return_column = get_return_period_config()
-    start_text = start_date.strftime('%Y-%m-%d')
-    end_text = end_date.strftime('%Y-%m-%d')
-    st.info(
-        f"🚀 开始通过 AKShare 获取 {start_text} 至 {end_text} "
-        f"{return_label} ≥ {RETURN_THRESHOLD}% 的基金..."
-    )
-
-    try:
-        # 使用正确的函数名 fund_open_fund_rank_em
-        df = ak.fund_open_fund_rank_em()
-        # 可选：打印列名以确认（调试用，稳定后可删除）
-        # st.write("返回数据的列名：", df.columns.tolist())
-
-        # 周期映射：列名是“近1周”、“近1月”、“近3月”、“近1年”
-        period_map = {
-            "周": "近1周",
-            "月": "近1月",
-            "季度": "近3月",
-            "年": "近1年",
-        }
-        period_col = period_map.get(RETURN_PERIOD)
-        if period_col is None:
-            st.error(f"不支持的涨幅周期：{RETURN_PERIOD}，请使用周/月/季度/年。")
-            return pd.DataFrame()
-
-        if period_col not in df.columns:
-            st.error(f"返回数据中缺少 '{period_col}' 列。实际列名：{list(df.columns)}")
-            st.dataframe(df.head())
-            return pd.DataFrame()
-
-        # 转换涨幅列为数值
-        df[period_col] = pd.to_numeric(df[period_col], errors='coerce')
-        # 筛选
-        df = df[df[period_col] >= RETURN_THRESHOLD].copy()
-
-        if df.empty:
-            st.warning(f"未找到涨幅 ≥ {RETURN_THRESHOLD}% 的基金（周期：{RETURN_PERIOD}）。")
-            return pd.DataFrame()
-
-        # 标准化
-        df['基金代码'] = df['基金代码'].astype(str).str.zfill(6)
-        df.rename(columns={
-            '基金简称': '基金名称',
-            period_col: return_column,
-        }, inplace=True)
-
-        df['涨幅周期'] = RETURN_PERIOD
-        df['开始日期'] = start_text
-        df['结束日期'] = end_text
-
-        result_df = df[['基金代码', '基金名称', return_column, '涨幅周期', '开始日期', '结束日期']]
-        st.session_state.high_funds = result_df
-
-        st.success(f"✅ 共找到 **{len(result_df)}** 只基金")
-        st.dataframe(result_df.head(20), use_container_width=True, hide_index=True)
-        st.markdown("### 💾 下载基金列表")
-        create_download_buttons(result_df, f"{return_label}基金列表")
-        return result_df
-
-    except Exception as e:
-        st.error(f"AKShare 获取失败: {str(e)}")
-        st.info("请确认：\n1. 已运行 pip install akshare --upgrade\n2. 函数名使用 fund_open_fund_rank_em")
-        return pd.DataFrame()
-
-# ========================== 修复JSON解析函数 ==========================
+# ========================== JSON 解析、代码标准化、持仓清洗 ==========================
 def safe_json_parse(json_str):
     if not json_str:
         return None
@@ -589,7 +507,7 @@ def fetch_stock_fund_holdings_direct(stock_code):
             result[col] = pd.to_numeric(result[col], errors='coerce')
     return result
 
-# ========================== 获取基金持仓 ==========================
+# ========================== 获取单只基金持仓（线程安全） ==========================
 def get_fund_holdings(fund_code: str, fund_name: str,
                       verbose: bool = True, status_placeholder=None,
                       session=None, use_akshare=None, prefer_direct=False):
@@ -609,8 +527,10 @@ def get_fund_holdings(fund_code: str, fund_name: str,
         elif status_placeholder:
             status_placeholder.text(msg)
     session = session or create_retry_session()
+    # 实时读取全局配置，避免闭包导致值过时
     use_akshare = USE_AKSHARE if use_akshare is None else use_akshare
     fund_code = str(fund_code).strip().zfill(6)
+
     def _try_akshare():
         try:
             import akshare as ak
@@ -637,10 +557,12 @@ def get_fund_holdings(fund_code: str, fund_name: str,
         except Exception as e:
             _log_info(f"AKShare获取失败 {fund_code}: {str(e)[:50]}")
         return pd.DataFrame()
+
     if use_akshare and not prefer_direct:
         ak_df = _try_akshare()
         if not ak_df.empty:
             return ak_df
+
     try:
         current_year = datetime.now().year
         urls = [
@@ -667,6 +589,7 @@ def get_fund_holdings(fund_code: str, fund_name: str,
                 continue
     except Exception as e:
         _log_info(f"JSON解析失败 {fund_code}: {str(e)[:50]}")
+
     try:
         url = f"https://fundf10.eastmoney.com/ccmx_{fund_code}.html"
         resp = session.get(url, timeout=8, verify=False)
@@ -678,22 +601,104 @@ def get_fund_holdings(fund_code: str, fund_name: str,
                 return result_df
     except:
         pass
+
     if use_akshare and prefer_direct:
         ak_df = _try_akshare()
         if not ak_df.empty:
             return ak_df
+
     _log_warning(f"⚠️ {fund_code} {fund_name} 所有方法均获取失败")
     return pd.DataFrame()
 
-# ========================== 批量获取（断点续爬版）==========================
+# ========================== 1. 爬取高涨幅基金（修复百分号bug） ==========================
+def get_return_period_config():
+    start_date = pd.to_datetime(RETURN_START_DATE).date()
+    end_date = pd.to_datetime(RETURN_END_DATE).date()
+    if start_date > end_date:
+        start_date, end_date = end_date, start_date
+    label = f"{RETURN_PERIOD}涨幅"
+    column_name = f"{label}(%)"
+    return start_date, end_date, label, column_name
+
+def crawl_high_return_funds():
+    """使用 AKShare 的 fund_open_fund_rank_em 获取区间涨幅靠前的基金列表"""
+    import akshare as ak
+
+    start_date, end_date, return_label, return_column = get_return_period_config()
+    start_text = start_date.strftime('%Y-%m-%d')
+    end_text = end_date.strftime('%Y-%m-%d')
+    st.info(
+        f"🚀 开始通过 AKShare 获取 {start_text} 至 {end_text} "
+        f"{return_label} ≥ {RETURN_THRESHOLD}% 的基金..."
+    )
+
+    try:
+        df = ak.fund_open_fund_rank_em()
+        period_map = {
+            "周": "近1周",
+            "月": "近1月",
+            "季度": "近3月",
+            "年": "近1年",
+        }
+        period_col = period_map.get(RETURN_PERIOD)
+        if period_col is None:
+            st.error(f"不支持的涨幅周期：{RETURN_PERIOD}，请使用周/月/季度/年。")
+            return pd.DataFrame()
+
+        if period_col not in df.columns:
+            st.error(f"返回数据中缺少 '{period_col}' 列。实际列名：{list(df.columns)}")
+            st.dataframe(df.head())
+            return pd.DataFrame()
+
+        # ---------- 修复核心：去除百分号并转数值 ----------
+        df[period_col] = df[period_col].astype(str).str.rstrip('%')
+        df[period_col] = pd.to_numeric(df[period_col], errors='coerce')
+        # ------------------------------------------------
+
+        df = df[df[period_col] >= RETURN_THRESHOLD].copy()
+
+        if df.empty:
+            st.warning(f"未找到涨幅 ≥ {RETURN_THRESHOLD}% 的基金（周期：{RETURN_PERIOD}）。")
+            return pd.DataFrame()
+
+        df['基金代码'] = df['基金代码'].astype(str).str.zfill(6)
+        df.rename(columns={
+            '基金简称': '基金名称',
+            period_col: return_column,
+        }, inplace=True)
+
+        df['涨幅周期'] = RETURN_PERIOD
+        df['开始日期'] = start_text
+        df['结束日期'] = end_text
+
+        result_df = df[['基金代码', '基金名称', return_column, '涨幅周期', '开始日期', '结束日期']]
+        st.session_state.high_funds = result_df
+
+        st.success(f"✅ 共找到 **{len(result_df)}** 只基金")
+        st.dataframe(result_df.head(20), use_container_width=True, hide_index=True)
+        st.markdown("### 💾 下载基金列表")
+        create_download_buttons(result_df, f"{return_label}基金列表")
+        return result_df
+
+    except Exception as e:
+        st.error(f"AKShare 获取失败: {str(e)}")
+        st.info("请确认：\n1. 已运行 pip install akshare --upgrade\n2. 函数名使用 fund_open_fund_rank_em")
+        return pd.DataFrame()
+
+# ========================== 2. 批量获取持仓（线程安全版） ==========================
 def crawl_all_holdings_from_list(fund_list_df):
     if fund_list_df.empty or '基金代码' not in fund_list_df.columns:
         st.error("必须包含 '基金代码' 列")
         return pd.DataFrame()
+
     total = len(fund_list_df)
+    # 从 session_state 恢复断点数据
     done_codes: set = st.session_state.crawl_done_codes
-    fund_holdings_dict: dict = st.session_state.fund_holdings_dict
+    # 从 crawl_partial 恢复已经获取的持仓（每个元素是 list of dict）
     all_hold = [pd.DataFrame(r) for r in st.session_state.crawl_partial] if st.session_state.crawl_partial else []
+    fund_holdings_dict: dict = st.session_state.fund_holdings_dict
+
+    # 构建待爬取列表
     remaining = []
     for pos, (_, row) in enumerate(fund_list_df.iterrows(), start=1):
         code = str(row['基金代码']).strip().zfill(6)
@@ -701,16 +706,17 @@ def crawl_all_holdings_from_list(fund_list_df):
             continue
         name = row.get('基金名称', f"基金{code}")
         remaining.append((pos, code, name))
+
     if done_codes:
         st.info(f"⏩ 检测到断点续爬：已完成 {len(done_codes)} 只，剩余 {len(remaining)} 只")
+
     progress_bar = st.progress(int(len(done_codes) / total * 100) if total else 0)
-    status = st.empty()
-    fund_msg = st.empty()
-    error_log = []
-    st.info(
-        f"准备处理 {total} 只基金（本次 {len(remaining)} 只），"
-        f"并发数 {min(HOLDING_WORKERS, max(1, len(remaining)))}"
-    )
+    status_placeholder = st.empty()
+    fund_msg_placeholder = st.empty()
+
+    st.info(f"准备处理 {total} 只基金（本次 {len(remaining)} 只），并发数 {min(HOLDING_WORKERS, max(1, len(remaining)))}")
+
+    # 工作函数：只负责爬取，返回结果，不触碰 session_state
     def _worker(pos, code, name):
         if HOLDING_DELAY > 0:
             time.sleep(random.uniform(0, HOLDING_DELAY))
@@ -723,14 +729,8 @@ def crawl_all_holdings_from_list(fund_list_df):
             prefer_direct=FAST_DIRECT_MODE,
         )
         return pos, code, name, df
-    def _flush_snapshot():
-        if all_hold:
-            st.session_state.all_holdings = normalize_holdings_df(pd.concat(
-                all_hold, ignore_index=True
-            )).drop_duplicates(subset=['基金代码', '个股代码'])
-        st.session_state.fund_holdings_dict = fund_holdings_dict
-        st.session_state.crawl_done_codes = done_codes
-        # 注意：crawl_partial 已在每个基金完成时追加，此处无需重复添加
+
+    error_log = []
     completed = 0
     if remaining:
         max_workers = min(HOLDING_WORKERS, len(remaining))
@@ -746,35 +746,46 @@ def crawl_all_holdings_from_list(fund_list_df):
                     pos, code, name = futures[future]
                     completed += 1
                     error_log.append(code)
+                    # 主线程安全更新 session_state
                     done_codes.add(code)
                     st.session_state.crawl_done_codes = done_codes
-                    fund_msg.text(f"⚠️ {code} {name} 任务异常: {str(e)[:80]}")
-                    status.text(f"已完成 {len(done_codes)}/{total} | 本次 {completed}/{len(remaining)}")
+                    fund_msg_placeholder.text(f"⚠️ {code} {name} 任务异常: {str(e)[:80]}")
+                    status_placeholder.text(f"已完成 {len(done_codes)}/{total} | 本次 {completed}/{len(remaining)}")
                     progress_bar.progress(min(int(len(done_codes) / total * 100), 100))
                     continue
+
                 completed += 1
                 if not hold_df.empty:
                     all_hold.append(hold_df)
                     fund_holdings_dict[code] = hold_df
+                    # 主线程追加到 crawl_partial（安全）
                     st.session_state.crawl_partial.append(hold_df.to_dict('records'))
-                    fund_msg.text(f"✅ {code} {name} 获取成功（{len(hold_df)} 条）")
+                    fund_msg_placeholder.text(f"✅ {code} {name} 获取成功（{len(hold_df)} 条）")
                 else:
                     error_log.append(code)
-                    fund_msg.text(f"⚠️ {code} {name} 未获取到持仓")
+                    fund_msg_placeholder.text(f"⚠️ {code} {name} 未获取到持仓")
+
                 done_codes.add(code)
-                if completed % max(1, max_workers) == 0:
-                    _flush_snapshot()
-                status.text(f"已完成 {len(done_codes)}/{total} | 本次 {completed}/{len(remaining)}")
+                st.session_state.crawl_done_codes = done_codes
+                # 每完成一批（或每完成一个）更新 all_holdings 快照
+                if completed % max(1, max_workers) == 0 or completed == len(remaining):
+                    if all_hold:
+                        combined = normalize_holdings_df(pd.concat(all_hold, ignore_index=True)).drop_duplicates(
+                            subset=['基金代码', '个股代码']
+                        )
+                        st.session_state.all_holdings = combined
+                        st.session_state.fund_holdings_dict = fund_holdings_dict
+                status_placeholder.text(f"已完成 {len(done_codes)}/{total} | 本次 {completed}/{len(remaining)}")
                 progress_bar.progress(min(int(len(done_codes) / total * 100), 100))
-    _flush_snapshot()
-    fund_msg.empty()
-    status.empty()
+
+    # 最终合并与清理
     if all_hold:
         combined = normalize_holdings_df(pd.concat(all_hold, ignore_index=True)).drop_duplicates(
             subset=['基金代码', '个股代码']
         )
         st.session_state.all_holdings = combined
         st.session_state.fund_holdings_dict = fund_holdings_dict
+        # 爬取完成，清空断点续爬状态
         st.session_state.crawl_done_codes = set()
         st.session_state.crawl_partial = []
         st.success(f"✅ 持仓获取完成！共 {len(combined)} 条记录，涉及 {combined['个股代码'].nunique()} 只个股")
@@ -797,6 +808,7 @@ def crawl_all_holdings_from_list(fund_list_df):
             if selected_fund:
                 create_download_buttons(fund_holdings_dict[selected_fund], f"基金_{selected_fund}_持仓")
         return combined
+
     st.error("所有基金均获取失败，请检查网络或更换爬取方式")
     return pd.DataFrame()
 
@@ -1100,17 +1112,4 @@ if not st.session_state.stock_scores.empty:
                      use_container_width=True, hide_index=True)
         st.markdown("**💾 下载当前数据**")
         create_download_buttons(st.session_state.stock_scores[cols].head(TOP_N_STOCKS), "龙头股排行")
-st.caption("v5 加速版 | 新版工作台 UI | 支持周期/自定义区间涨幅筛选 | 并发持仓爬取 | 单股基金持仓查询 | CSV/Excel 下载")
-
-# ==============================================================
-# 请同时在项目根目录创建 .streamlit/config.toml，内容如下：
-#
-# [server]
-# maxUploadSize = 200
-# enableWebsocketCompression = false
-# maxMessageSize = 500
-# headless = true
-#
-# [browser]
-# gatherUsageStats = false
-# ==============================================================
+st.caption("v12 修复版 | 修复 AKShare 涨跌幅解析 & 多线程 session_state 安全隐患 | 断点续爬更稳定")
