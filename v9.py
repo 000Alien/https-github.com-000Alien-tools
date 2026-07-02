@@ -212,6 +212,7 @@ with st.sidebar.expander("基金筛选", expanded=True):
 
 with st.sidebar.expander("持仓爬取", expanded=True):
     HOLDING_WORKERS = st.slider("持仓并发数", 1, 16, 8, help="网络稳定时可调高；失败增多时调低。")
+    HOLDING_BATCH_SIZE = st.slider("每轮处理基金数", 20, 500, 120, 20, help="每次点击只处理一批，完成后自动保存；剩余基金可再次点击继续。")
     HOLDING_DELAY = st.slider("请求抖动(秒)", 0.0, 2.0, 0.2, 0.1, help="给并发请求增加少量随机错峰。")
     DELAY_MIN = st.slider("基金列表请求间隔(秒)", 0.2, 5.0, 1.0, 0.1)
     FAST_DIRECT_MODE = st.checkbox("批量优先直连东方财富", value=True)
@@ -802,26 +803,37 @@ def crawl_all_holdings_from_list(fund_list_df):
     all_hold = [pd.DataFrame(r) for r in st.session_state.crawl_partial] if st.session_state.crawl_partial else []
     fund_holdings_dict: dict = dict(st.session_state.fund_holdings_dict)
 
-    # 构建待爬取列表
+    # 构建待爬取列表：本轮优先处理未尝试项，失败项留给后续重试，避免坏基金反复拖慢。
     remaining = []
+    retry_remaining = []
     for pos, (_, row) in enumerate(fund_list_df.iterrows(), start=1):
         code = str(row['基金代码']).strip().zfill(6)
         if code in done_codes:
             continue
         name = row.get('基金名称', f"基金{code}")
-        remaining.append((pos, code, name))
+        if code in failed_codes:
+            retry_remaining.append((pos, code, name))
+        else:
+            remaining.append((pos, code, name))
+    remaining = remaining + retry_remaining
+    pending_total = len(remaining)
+    batch_limit = min(HOLDING_BATCH_SIZE, pending_total) if pending_total else 0
+    current_batch = remaining[:batch_limit]
 
     if done_codes or failed_codes:
         st.info(
             f"⏩ 检测到断点续爬：已成功 {len(done_codes)} 只，"
-            f"待重试 {len(failed_codes)} 只，剩余 {len(remaining)} 只"
+            f"待重试 {len(failed_codes)} 只，剩余 {pending_total} 只"
         )
 
     progress_bar = st.progress(int(len(done_codes) / total * 100) if total else 0)
     status_placeholder = st.empty()
     fund_msg_placeholder = st.empty()
 
-    st.info(f"准备处理 {total} 只基金（本次 {len(remaining)} 只），并发数 {min(HOLDING_WORKERS, max(1, len(remaining)))}")
+    st.info(
+        f"准备处理 {total} 只基金（本轮 {len(current_batch)} 只，剩余 {pending_total} 只），"
+        f"并发数 {min(HOLDING_WORKERS, max(1, len(current_batch)))}"
+    )
 
     # 工作函数：只负责爬取，返回结果，不触碰 session_state
     def _worker(pos, code, name):
@@ -847,17 +859,17 @@ def crawl_all_holdings_from_list(fund_list_df):
         status_placeholder.text(
             f"总进度 {processed_total}/{total} | "
             f"成功 {len(done_codes)} | 失败待重试 {len(failed_codes)} | "
-            f"本次处理 {completed}/{len(remaining)}"
+            f"本轮处理 {completed}/{len(current_batch)}"
         )
         if force_snapshot and all_hold:
             save_holdings_snapshot(all_hold, fund_holdings_dict)
 
     _refresh_progress()
 
-    if remaining:
-        max_workers = min(HOLDING_WORKERS, len(remaining))
+    if current_batch:
+        max_workers = min(HOLDING_WORKERS, len(current_batch))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            pending_items = iter(remaining)
+            pending_items = iter(current_batch)
             futures = {}
 
             def _submit_next():
@@ -914,16 +926,18 @@ def crawl_all_holdings_from_list(fund_list_df):
                     st.session_state.crawl_failed_codes = failed_codes
                     # 每完成一批（或每完成一个）更新 all_holdings 快照
                     _refresh_progress(
-                        force_snapshot=completed % max(1, max_workers) == 0 or completed == len(remaining)
+                        force_snapshot=completed % max(1, max_workers) == 0 or completed == len(current_batch)
                     )
 
     # 最终合并与清理
     if all_hold:
         combined = save_holdings_snapshot(all_hold, fund_holdings_dict)
-        if error_log:
+        remaining_after_batch = total - len(done_codes)
+        if error_log or remaining_after_batch > 0:
             st.warning(
-                f"已保存当前成功获取的数据：共 {len(combined)} 条记录，"
-                f"涉及 {combined['个股代码'].nunique()} 只个股。失败项可再次点击按钮重试。"
+                f"本轮已结束并保存当前数据：共 {len(combined)} 条记录，"
+                f"涉及 {combined['个股代码'].nunique()} 只个股。"
+                f"还有 {remaining_after_batch} 只基金未成功完成，可再次点击继续。"
             )
         else:
             # 全部成功后清空断点续爬状态，保留可下载结果。
@@ -955,7 +969,10 @@ def crawl_all_holdings_from_list(fund_list_df):
                     create_download_buttons(hold_df, f"基金_{code}_持仓")
         return combined
 
-    st.error("所有基金均获取失败，请检查网络或更换爬取方式")
+    if current_batch:
+        st.error("本轮基金均获取失败，请调低并发数、增大请求抖动，或稍后再次点击继续。")
+    else:
+        st.info("没有需要处理的基金。")
     return pd.DataFrame()
 
 # ========================== 文件读取 ==========================
@@ -1153,7 +1170,7 @@ if st.session_state.crawl_done_codes or st.session_state.crawl_failed_codes:
     st.warning(
         f"⚠️ 检测到未完成的爬取任务（已成功 {len(st.session_state.crawl_done_codes)} 只基金，"
         f"待重试 {len(st.session_state.crawl_failed_codes)} 只）。"
-        "点击「从爬取结果获取持仓」可继续；点击「清空所有数据」可重新开始。"
+        "点击「从爬取结果获取持仓/继续下一批」可继续；点击「清空所有数据」可重新开始。"
     )
 tab_crawl, tab_import, tab_download, tab_stock_query = st.tabs([
     "📈 从涨幅基金爬取",
@@ -1174,7 +1191,7 @@ with tab_crawl:
             with st.spinner("爬取中..."):
                 crawl_high_return_funds()
     with col2:
-        if st.button("2️⃣ 从爬取结果获取持仓", type="primary", use_container_width=True):
+        if st.button("2️⃣ 从爬取结果获取持仓/继续下一批", type="primary", use_container_width=True):
             if st.session_state.high_funds.empty:
                 st.error("请先执行步骤 1")
             else:
