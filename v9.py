@@ -170,6 +170,7 @@ _default_state = {
     'crawl_failed_codes': set(),
     'crawl_task_signature': '',
     'crawl_partial': [],
+    'crawl_last_flush_at': 0.0,
 }
 for key, default in _default_state.items():
     if key not in st.session_state:
@@ -216,6 +217,11 @@ with st.sidebar.expander("持仓爬取", expanded=True):
     DELAY_MIN = st.slider("基金列表请求间隔(秒)", 0.2, 5.0, 1.0, 0.1)
     FAST_DIRECT_MODE = st.checkbox("批量优先直连东方财富", value=True)
     USE_AKSHARE = st.checkbox("启用 AKShare 兜底/单只优先", value=True)
+    BULK_SKIP_AKSHARE_FALLBACK = st.checkbox(
+        "批量爬取跳过 AKShare 慢兜底",
+        value=True,
+        help="大批量爬取时建议开启，避免少数 AKShare 请求长时间占住线程；单只基金下载不受影响。"
+    )
 
 with st.sidebar.expander("结果展示", expanded=True):
     TOP_N_STOCKS = st.slider("龙头榜显示数量", 10, 100, 30)
@@ -298,6 +304,21 @@ def save_holdings_snapshot(all_hold, fund_holdings_dict):
     )
     st.session_state.all_holdings = combined
     st.session_state.fund_holdings_dict = fund_holdings_dict
+    return combined
+
+def append_holdings_snapshot(new_frames, fund_holdings_dict):
+    if not new_frames:
+        return st.session_state.all_holdings
+    frames = []
+    if not st.session_state.all_holdings.empty:
+        frames.append(st.session_state.all_holdings)
+    frames.extend(new_frames)
+    combined = normalize_holdings_df(pd.concat(frames, ignore_index=True)).drop_duplicates(
+        subset=['基金代码', '个股代码']
+    )
+    st.session_state.all_holdings = combined
+    st.session_state.fund_holdings_dict = fund_holdings_dict
+    st.session_state.crawl_last_flush_at = time.time()
     return combined
 
 def render_any_data_downloads(title="固定下载区"):
@@ -790,6 +811,7 @@ def crawl_all_holdings_from_list(fund_list_df):
         st.session_state.crawl_done_codes = set()
         st.session_state.crawl_failed_codes = set()
         st.session_state.crawl_partial = []
+        st.session_state.crawl_last_flush_at = 0.0
         st.session_state.fund_holdings_dict = {}
         st.session_state.all_holdings = pd.DataFrame()
         st.session_state.stock_scores = pd.DataFrame()
@@ -798,9 +820,18 @@ def crawl_all_holdings_from_list(fund_list_df):
     # 从 session_state 恢复断点数据
     done_codes: set = set(st.session_state.crawl_done_codes)
     failed_codes: set = set(st.session_state.crawl_failed_codes)
-    # 从 crawl_partial 恢复已经获取的持仓（每个元素是 list of dict）
-    all_hold = [pd.DataFrame(r) for r in st.session_state.crawl_partial] if st.session_state.crawl_partial else []
+    # 优先使用已保存的汇总快照，避免恢复时展开数千个小对象导致卡顿。
+    if not st.session_state.all_holdings.empty:
+        all_hold = [st.session_state.all_holdings]
+    else:
+        all_hold = [pd.DataFrame(r) for r in st.session_state.crawl_partial] if st.session_state.crawl_partial else []
+        if all_hold:
+            st.session_state.all_holdings = normalize_holdings_df(
+                pd.concat(all_hold, ignore_index=True)
+            ).drop_duplicates(subset=['基金代码', '个股代码'])
+            all_hold = [st.session_state.all_holdings]
     fund_holdings_dict: dict = dict(st.session_state.fund_holdings_dict)
+    new_hold_buffer = []
 
     # 构建待爬取列表：本次全量处理所有剩余项，失败项后置重试，避免坏基金优先拖慢启动。
     remaining = []
@@ -841,7 +872,7 @@ def crawl_all_holdings_from_list(fund_list_df):
             name,
             verbose=False,
             session=get_thread_session(),
-            use_akshare=USE_AKSHARE,
+            use_akshare=USE_AKSHARE and not BULK_SKIP_AKSHARE_FALLBACK,
             prefer_direct=FAST_DIRECT_MODE,
         )
         return pos, code, name, df
@@ -849,6 +880,17 @@ def crawl_all_holdings_from_list(fund_list_df):
     error_log = []
     completed = 0
     success_start = len(done_codes)
+
+    def _flush_new_holdings(force=False):
+        nonlocal new_hold_buffer, all_hold
+        if not new_hold_buffer:
+            return st.session_state.all_holdings
+        if not force and len(new_hold_buffer) < 100 and time.time() - st.session_state.crawl_last_flush_at < 20:
+            return st.session_state.all_holdings
+        combined = append_holdings_snapshot(new_hold_buffer, fund_holdings_dict)
+        all_hold = [combined] if not combined.empty else []
+        new_hold_buffer = []
+        return combined
 
     def _refresh_progress(force_snapshot=False):
         processed_total = min(success_start + completed, total)
@@ -858,8 +900,8 @@ def crawl_all_holdings_from_list(fund_list_df):
             f"成功 {len(done_codes)} | 失败待重试 {len(failed_codes)} | "
             f"本次处理 {completed}/{pending_total}"
         )
-        if force_snapshot and all_hold:
-            save_holdings_snapshot(all_hold, fund_holdings_dict)
+        if force_snapshot:
+            _flush_new_holdings(force=True)
 
     _refresh_progress()
 
@@ -907,10 +949,9 @@ def crawl_all_holdings_from_list(fund_list_df):
 
                     completed += 1
                     if not hold_df.empty:
-                        all_hold.append(hold_df)
-                        fund_holdings_dict[code] = hold_df
-                        # 主线程追加到 crawl_partial（安全）
-                        st.session_state.crawl_partial.append(hold_df.to_dict('records'))
+                        new_hold_buffer.append(hold_df)
+                        if len(fund_holdings_dict) < 100 or code in fund_holdings_dict:
+                            fund_holdings_dict[code] = hold_df
                         fund_msg_placeholder.text(f"✅ {code} {name} 获取成功（{len(hold_df)} 条）")
                         done_codes.add(code)
                         failed_codes.discard(code)
@@ -921,14 +962,19 @@ def crawl_all_holdings_from_list(fund_list_df):
 
                     st.session_state.crawl_done_codes = done_codes
                     st.session_state.crawl_failed_codes = failed_codes
-                    # 每完成一批（或每完成一个）更新 all_holdings 快照
+                    # 增量保存，避免几千只基金后频繁全量 concat 造成停滞。
                     _refresh_progress(
-                        force_snapshot=completed % max(1, max_workers) == 0 or completed == pending_total
+                        force_snapshot=(
+                            len(new_hold_buffer) >= 100
+                            or completed == pending_total
+                            or time.time() - st.session_state.crawl_last_flush_at >= 20
+                        )
                     )
 
     # 最终合并与清理
-    if all_hold:
-        combined = save_holdings_snapshot(all_hold, fund_holdings_dict)
+    _flush_new_holdings(force=True)
+    if not st.session_state.all_holdings.empty:
+        combined = st.session_state.all_holdings
         remaining_after_run = total - len(done_codes)
         if error_log or remaining_after_run > 0:
             st.warning(
@@ -1251,6 +1297,7 @@ with col2:
         st.session_state.crawl_failed_codes = set()
         st.session_state.crawl_task_signature = ''
         st.session_state.crawl_partial = []
+        st.session_state.crawl_last_flush_at = 0.0
         st.success("已清空所有数据（含断点续爬记录）")
 with col3:
     if not st.session_state.all_holdings.empty or not st.session_state.stock_scores.empty:
