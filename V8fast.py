@@ -5,7 +5,7 @@
 # 3. 优化爬取过程中的状态更新逻辑，杜绝并发冲突
 # 4. 微调 JSON 解析健壮性，避免少数特殊字符导致崩溃
 # 5. 保留原有断点续爬与 UI 功能
-# 6. 20260614修改代码 
+# 6. 20260614修改代码
 
 import streamlit as st
 import pandas as pd
@@ -16,8 +16,9 @@ import random
 import json
 import ssl
 import threading
+import hashlib
 import urllib3
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime, timedelta
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -166,11 +167,15 @@ _default_state = {
     'stock_scores': pd.DataFrame(),
     'fund_holdings_dict': {},
     'crawl_done_codes': set(),
+    'crawl_failed_codes': set(),
+    'crawl_task_signature': '',
     'crawl_partial': [],
+    'crawl_last_flush_at': 0.0,
 }
 for key, default in _default_state.items():
     if key not in st.session_state:
         st.session_state[key] = default
+_download_button_counter = 0
 
 # 侧边栏控件
 st.sidebar.title("控制台")
@@ -178,8 +183,12 @@ st.sidebar.caption("先设定基金筛选口径，再执行主界面的爬取、
 today_date = datetime.now().date()
 
 with st.sidebar.expander("基金筛选", expanded=True):
-    RETURN_PERIOD = st.selectbox("涨幅周期", ["周", "月", "季度", "年"], index=2)
-    if RETURN_PERIOD == "周":
+    RETURN_PERIOD = st.selectbox("涨幅周期", ["日", "周", "月", "季度", "年"], index=3)
+    if RETURN_PERIOD == "日":
+        RETURN_START_DATE = today_date - timedelta(days=1)
+        RETURN_END_DATE = today_date
+        default_threshold = 1.0
+    elif RETURN_PERIOD == "周":
         RETURN_START_DATE = today_date - timedelta(days=7)
         RETURN_END_DATE = today_date
         default_threshold = 5.0
@@ -212,6 +221,11 @@ with st.sidebar.expander("持仓爬取", expanded=True):
     DELAY_MIN = st.slider("基金列表请求间隔(秒)", 0.2, 5.0, 1.0, 0.1)
     FAST_DIRECT_MODE = st.checkbox("批量优先直连东方财富", value=True)
     USE_AKSHARE = st.checkbox("启用 AKShare 兜底/单只优先", value=True)
+    BULK_SKIP_AKSHARE_FALLBACK = st.checkbox(
+        "批量爬取跳过 AKShare 慢兜底",
+        value=True,
+        help="大批量爬取时建议开启，避免少数 AKShare 请求长时间占住线程；单只基金下载不受影响。"
+    )
 
 with st.sidebar.expander("结果展示", expanded=True):
     TOP_N_STOCKS = st.slider("龙头榜显示数量", 10, 100, 30)
@@ -236,6 +250,10 @@ def convert_df_to_excel(df):
 def create_download_buttons(df, title_prefix):
     if df.empty:
         return
+    global _download_button_counter
+    _download_button_counter += 1
+    safe_title = re.sub(r'\W+', '_', str(title_prefix)).strip('_') or 'data'
+    key_base = f"{safe_title}_{_download_button_counter}"
     col1, col2, col3 = st.columns(3)
     with col1:
         csv_data = convert_df_to_csv(df)
@@ -245,7 +263,7 @@ def create_download_buttons(df, title_prefix):
                 data=csv_data,
                 file_name=f"{title_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                 mime="text/csv",
-                key=f"{title_prefix}_csv"
+                key=f"{key_base}_csv"
             )
     with col2:
         excel_data = convert_df_to_excel(df)
@@ -255,10 +273,115 @@ def create_download_buttons(df, title_prefix):
                 data=excel_data,
                 file_name=f"{title_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key=f"{title_prefix}_excel"
+                key=f"{key_base}_excel"
             )
     with col3:
         st.metric("数据行数", len(df))
+
+def get_fund_list_signature(fund_list_df):
+    if fund_list_df.empty or '基金代码' not in fund_list_df.columns:
+        return ''
+    codes = [
+        str(code).strip().zfill(6)
+        for code in fund_list_df['基金代码'].dropna().tolist()
+    ]
+    payload = '|'.join(sorted(set(codes)))
+    return hashlib.sha256(payload.encode('utf-8')).hexdigest()
+
+def build_partial_holdings_df():
+    frames = [
+        pd.DataFrame(records)
+        for records in st.session_state.crawl_partial
+        if records
+    ]
+    if not frames:
+        return pd.DataFrame()
+    return normalize_holdings_df(pd.concat(frames, ignore_index=True)).drop_duplicates(
+        subset=['基金代码', '个股代码']
+    )
+
+def save_holdings_snapshot(all_hold, fund_holdings_dict):
+    if not all_hold:
+        return pd.DataFrame()
+    combined = normalize_holdings_df(pd.concat(all_hold, ignore_index=True)).drop_duplicates(
+        subset=['基金代码', '个股代码']
+    )
+    st.session_state.all_holdings = combined
+    st.session_state.fund_holdings_dict = fund_holdings_dict
+    return combined
+
+def append_holdings_snapshot(new_frames, fund_holdings_dict):
+    if not new_frames:
+        return st.session_state.all_holdings
+    frames = []
+    if not st.session_state.all_holdings.empty:
+        frames.append(st.session_state.all_holdings)
+    frames.extend(new_frames)
+    combined = normalize_holdings_df(pd.concat(frames, ignore_index=True)).drop_duplicates(
+        subset=['基金代码', '个股代码']
+    )
+    st.session_state.all_holdings = combined
+    st.session_state.fund_holdings_dict = fund_holdings_dict
+    st.session_state.crawl_last_flush_at = time.time()
+    return combined
+
+def render_any_data_downloads(title="固定下载区"):
+    def _render_slot(name, df):
+        st.markdown(f"**{name}**")
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            create_download_buttons(df, name)
+            return
+        safe_name = re.sub(r'\W+', '_', str(name)).strip('_') or 'empty'
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.download_button(
+                "📥 下载 CSV",
+                data=b"",
+                file_name=f"{name}.csv",
+                disabled=True,
+                key=f"{safe_name}_empty_csv"
+            )
+        with col2:
+            st.download_button(
+                "📊 下载 Excel",
+                data=b"",
+                file_name=f"{name}.xlsx",
+                disabled=True,
+                key=f"{safe_name}_empty_excel"
+            )
+        with col3:
+            st.metric("数据行数", 0)
+
+    partial_df = build_partial_holdings_df()
+    holding_df = st.session_state.all_holdings
+    if holding_df.empty and not partial_df.empty:
+        holding_df = partial_df
+
+    st.markdown(f"### 💾 {title}")
+    _render_slot("涨幅基金列表", st.session_state.high_funds)
+    _render_slot("全部基金持仓明细", holding_df)
+    _render_slot("龙头股评分", st.session_state.stock_scores)
+
+    fund_holdings_items = [
+        (code, df)
+        for code, df in st.session_state.fund_holdings_dict.items()
+        if isinstance(df, pd.DataFrame) and not df.empty
+    ]
+    st.markdown("**单只基金持仓固定下载**")
+    if not fund_holdings_items:
+        st.caption("暂无单只基金持仓数据；爬取成功后这里会固定显示单只基金下载入口。")
+        return
+
+    max_fund_downloads = 100
+    if len(fund_holdings_items) > max_fund_downloads:
+        st.caption(
+            f"单只基金下载按钮较多，当前固定展示前 {max_fund_downloads} 只；"
+            "完整数据请下载“全部基金持仓明细”。"
+        )
+    for code, df in fund_holdings_items[:max_fund_downloads]:
+        fund_name = df['基金名称'].iloc[0] if '基金名称' in df.columns and not df.empty else f"基金{code}"
+        with st.expander(f"{code} - {fund_name}（{len(df)} 条）", expanded=False):
+            create_download_buttons(df, f"基金_{code}_持仓")
 
 def download_fund_individual_holdings():
     st.subheader("💾 下载单只基金持仓")
@@ -304,11 +427,6 @@ def safe_json_parse(json_str):
         pass
     try:
         return demjson3.decode(json_str)
-    except:
-        pass
-    try:
-        json_str_fixed = json_str.replace('null', 'None').replace('true', 'True').replace('false', 'False')
-        return eval(json_str_fixed)
     except:
         pass
     return None
@@ -584,7 +702,6 @@ def get_fund_holdings(fund_code: str, fund_name: str,
                             if not result_df.empty:
                                 _log_success(f"✅ {fund_code} JSON解析成功（{len(result_df)} 只个股）")
                                 return result_df
-                break
             except:
                 continue
     except Exception as e:
@@ -621,7 +738,7 @@ def get_return_period_config():
     return start_date, end_date, label, column_name
 
 def crawl_high_return_funds():
-    """使用 AKShare 的 fund_open_fund_rank_em 获取区间涨幅靠前的基金列表"""
+    """日涨幅使用每日净值表；周/月/季/年使用开放基金排行表。"""
     import akshare as ak
 
     start_date, end_date, return_label, return_column = get_return_period_config()
@@ -633,27 +750,38 @@ def crawl_high_return_funds():
     )
 
     try:
-        df = ak.fund_open_fund_rank_em()
+        if RETURN_PERIOD == "日":
+            df = ak.fund_open_fund_daily_em()
+        else:
+            df = ak.fund_open_fund_rank_em()
         period_map = {
+            "日": "日增长率",
             "周": "近1周",
             "月": "近1月",
             "季度": "近3月",
             "年": "近1年",
         }
-        period_col = period_map.get(RETURN_PERIOD)
-        if period_col is None:
-            st.error(f"不支持的涨幅周期：{RETURN_PERIOD}，请使用周/月/季度/年。")
+        period_candidates = period_map.get(RETURN_PERIOD)
+        if period_candidates is None:
+            st.error(f"不支持的涨幅周期：{RETURN_PERIOD}，请使用日/周/月/季度/年。")
             return pd.DataFrame()
+        if isinstance(period_candidates, str):
+            period_candidates = [period_candidates]
+        period_col = next((col for col in period_candidates if col in df.columns), None)
 
-        if period_col not in df.columns:
-            st.error(f"返回数据中缺少 '{period_col}' 列。实际列名：{list(df.columns)}")
+        if period_col is None:
+            st.error(f"返回数据中缺少 {period_candidates} 任一列。实际列名：{list(df.columns)}")
             st.dataframe(df.head())
             return pd.DataFrame()
 
-        # ---------- 修复核心：去除百分号并转数值 ----------
-        df[period_col] = df[period_col].astype(str).str.rstrip('%')
-        df[period_col] = pd.to_numeric(df[period_col], errors='coerce')
-        # ------------------------------------------------
+        def _to_percent_number(value):
+            text = str(value).replace(',', '').replace('%', '').strip()
+            if text in ['', '-', '--', 'nan', 'None']:
+                return None
+            match = re.search(r'-?\d+(?:\.\d+)?', text)
+            return float(match.group(0)) if match else None
+
+        df[period_col] = df[period_col].apply(_to_percent_number)
 
         df = df[df[period_col] >= RETURN_THRESHOLD].copy()
 
@@ -662,16 +790,44 @@ def crawl_high_return_funds():
             return pd.DataFrame()
 
         df['基金代码'] = df['基金代码'].astype(str).str.zfill(6)
+        df = df.sort_values(period_col, ascending=False)
+
+        date_col = next((col for col in ['净值日期', '日期', '净值日'] if col in df.columns), None)
+        inferred_date = ''
+        if RETURN_PERIOD == "日" and not date_col:
+            dated_columns = []
+            for col in df.columns:
+                match = re.search(r'(20\d{2}[-/]\d{1,2}[-/]\d{1,2})', str(col))
+                if match:
+                    dated_columns.append(match.group(1).replace('/', '-'))
+            inferred_date = max(dated_columns, default=today_date.strftime('%Y-%m-%d'))
         df.rename(columns={
             '基金简称': '基金名称',
             period_col: return_column,
         }, inplace=True)
 
         df['涨幅周期'] = RETURN_PERIOD
-        df['开始日期'] = start_text
-        df['结束日期'] = end_text
+        if RETURN_PERIOD == "日" and date_col:
+            df['净值日期'] = df[date_col].astype(str)
+            df['开始日期'] = df['净值日期']
+            df['结束日期'] = df['净值日期']
+        elif RETURN_PERIOD == "日":
+            df['净值日期'] = inferred_date
+            df['开始日期'] = inferred_date
+            df['结束日期'] = inferred_date
+        else:
+            df['开始日期'] = start_text
+            df['结束日期'] = end_text
 
-        result_df = df[['基金代码', '基金名称', return_column, '涨幅周期', '开始日期', '结束日期']]
+        result_cols = ['基金代码', '基金名称', return_column, '涨幅周期', '开始日期', '结束日期']
+        if RETURN_PERIOD == "日" and '净值日期' in df.columns:
+            result_cols.insert(3, '净值日期')
+            extra_cols = [
+                col for col in ['单位净值', '累计净值', '前交易日-单位净值', '前交易日-累计净值', '日增长值']
+                if col in df.columns
+            ]
+            result_cols.extend(extra_cols)
+        result_df = df[result_cols]
         st.session_state.high_funds = result_df
 
         st.success(f"✅ 共找到 **{len(result_df)}** 只基金")
@@ -682,7 +838,7 @@ def crawl_high_return_funds():
 
     except Exception as e:
         st.error(f"AKShare 获取失败: {str(e)}")
-        st.info("请确认：\n1. 已运行 pip install akshare --upgrade\n2. 函数名使用 fund_open_fund_rank_em")
+        st.info("请确认：\n1. 已运行 pip install akshare --upgrade\n2. 日涨幅接口 fund_open_fund_daily_em 可用\n3. 区间排行接口 fund_open_fund_rank_em 可用")
         return pd.DataFrame()
 
 # ========================== 2. 批量获取持仓（线程安全版） ==========================
@@ -692,29 +848,63 @@ def crawl_all_holdings_from_list(fund_list_df):
         return pd.DataFrame()
 
     total = len(fund_list_df)
-    # 从 session_state 恢复断点数据
-    done_codes: set = st.session_state.crawl_done_codes
-    # 从 crawl_partial 恢复已经获取的持仓（每个元素是 list of dict）
-    all_hold = [pd.DataFrame(r) for r in st.session_state.crawl_partial] if st.session_state.crawl_partial else []
-    fund_holdings_dict: dict = st.session_state.fund_holdings_dict
+    task_signature = get_fund_list_signature(fund_list_df)
+    if st.session_state.crawl_task_signature and st.session_state.crawl_task_signature != task_signature:
+        st.info("检测到新的基金列表，已重置上一轮断点续爬状态，避免不同任务的数据混合。")
+        st.session_state.crawl_done_codes = set()
+        st.session_state.crawl_failed_codes = set()
+        st.session_state.crawl_partial = []
+        st.session_state.crawl_last_flush_at = 0.0
+        st.session_state.fund_holdings_dict = {}
+        st.session_state.all_holdings = pd.DataFrame()
+        st.session_state.stock_scores = pd.DataFrame()
+    st.session_state.crawl_task_signature = task_signature
 
-    # 构建待爬取列表
+    # 从 session_state 恢复断点数据
+    done_codes: set = set(st.session_state.crawl_done_codes)
+    failed_codes: set = set(st.session_state.crawl_failed_codes)
+    # 优先使用已保存的汇总快照，避免恢复时展开数千个小对象导致卡顿。
+    if not st.session_state.all_holdings.empty:
+        all_hold = [st.session_state.all_holdings]
+    else:
+        all_hold = [pd.DataFrame(r) for r in st.session_state.crawl_partial] if st.session_state.crawl_partial else []
+        if all_hold:
+            st.session_state.all_holdings = normalize_holdings_df(
+                pd.concat(all_hold, ignore_index=True)
+            ).drop_duplicates(subset=['基金代码', '个股代码'])
+            all_hold = [st.session_state.all_holdings]
+    fund_holdings_dict: dict = dict(st.session_state.fund_holdings_dict)
+    new_hold_buffer = []
+
+    # 构建待爬取列表：本次全量处理所有剩余项，失败项后置重试，避免坏基金优先拖慢启动。
     remaining = []
+    retry_remaining = []
     for pos, (_, row) in enumerate(fund_list_df.iterrows(), start=1):
         code = str(row['基金代码']).strip().zfill(6)
         if code in done_codes:
             continue
         name = row.get('基金名称', f"基金{code}")
-        remaining.append((pos, code, name))
+        if code in failed_codes:
+            retry_remaining.append((pos, code, name))
+        else:
+            remaining.append((pos, code, name))
+    remaining = remaining + retry_remaining
+    pending_total = len(remaining)
 
-    if done_codes:
-        st.info(f"⏩ 检测到断点续爬：已完成 {len(done_codes)} 只，剩余 {len(remaining)} 只")
+    if done_codes or failed_codes:
+        st.info(
+            f"⏩ 检测到断点续爬：已成功 {len(done_codes)} 只，"
+            f"待重试 {len(failed_codes)} 只，剩余 {pending_total} 只"
+        )
 
     progress_bar = st.progress(int(len(done_codes) / total * 100) if total else 0)
     status_placeholder = st.empty()
     fund_msg_placeholder = st.empty()
 
-    st.info(f"准备处理 {total} 只基金（本次 {len(remaining)} 只），并发数 {min(HOLDING_WORKERS, max(1, len(remaining)))}")
+    st.info(
+        f"准备一次性处理全部剩余基金：共 {pending_total} 只，"
+        f"并发数 {min(HOLDING_WORKERS, max(1, pending_total))}"
+    )
 
     # 工作函数：只负责爬取，返回结果，不触碰 session_state
     def _worker(pos, code, name):
@@ -725,91 +915,167 @@ def crawl_all_holdings_from_list(fund_list_df):
             name,
             verbose=False,
             session=get_thread_session(),
-            use_akshare=USE_AKSHARE,
+            use_akshare=USE_AKSHARE and not BULK_SKIP_AKSHARE_FALLBACK,
             prefer_direct=FAST_DIRECT_MODE,
         )
         return pos, code, name, df
 
     error_log = []
     completed = 0
+    success_start = len(done_codes)
+    last_ui_update_at = 0.0
+
+    def _flush_new_holdings(force=False):
+        nonlocal new_hold_buffer, all_hold
+        if not new_hold_buffer:
+            return st.session_state.all_holdings
+        if not force and len(new_hold_buffer) < 100 and time.time() - st.session_state.crawl_last_flush_at < 20:
+            return st.session_state.all_holdings
+        combined = append_holdings_snapshot(new_hold_buffer, fund_holdings_dict)
+        all_hold = [combined] if not combined.empty else []
+        new_hold_buffer = []
+        return combined
+
+    def _refresh_progress(force_snapshot=False):
+        nonlocal last_ui_update_at
+        now = time.time()
+        if not force_snapshot and completed > 0 and now - last_ui_update_at < 0.2:
+            return
+        last_ui_update_at = now
+        processed_total = min(success_start + completed, total)
+        progress_value = min(int(processed_total / total * 100), 100) if total else 0
+        status_text = (
+            f"总体细节 {processed_total}/{total} | "
+            f"成功 {len(done_codes)} | 失败待重试 {len(failed_codes)} | "
+            f"本次处理 {completed}/{pending_total}"
+        )
+        try:
+            progress_bar.progress(progress_value, text=status_text)
+        except TypeError:
+            progress_bar.progress(progress_value)
+        with status_placeholder.container():
+            col_a, col_b, col_c, col_d = st.columns(4)
+            col_a.metric("总体细节", f"{processed_total}/{total}")
+            col_b.metric("成功", len(done_codes))
+            col_c.metric("失败待重试", len(failed_codes))
+            col_d.metric("本次处理", f"{completed}/{pending_total}")
+            st.caption(status_text)
+        if force_snapshot:
+            _flush_new_holdings(force=True)
+
+    _refresh_progress()
+
     if remaining:
         max_workers = min(HOLDING_WORKERS, len(remaining))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(_worker, pos, code, name): (pos, code, name)
-                for pos, code, name in remaining
-            }
-            for future in as_completed(futures):
+            pending_items = iter(remaining)
+            futures = {}
+
+            def _submit_next():
                 try:
-                    pos, code, name, hold_df = future.result()
-                except Exception as e:
-                    pos, code, name = futures[future]
-                    completed += 1
-                    error_log.append(code)
-                    # 主线程安全更新 session_state
-                    done_codes.add(code)
-                    st.session_state.crawl_done_codes = done_codes
-                    fund_msg_placeholder.text(f"⚠️ {code} {name} 任务异常: {str(e)[:80]}")
-                    status_placeholder.text(f"已完成 {len(done_codes)}/{total} | 本次 {completed}/{len(remaining)}")
-                    progress_bar.progress(min(int(len(done_codes) / total * 100), 100))
+                    pos, code, name = next(pending_items)
+                except StopIteration:
+                    return False
+                future = executor.submit(_worker, pos, code, name)
+                futures[future] = (pos, code, name)
+                return True
+
+            for _ in range(max_workers):
+                if not _submit_next():
+                    break
+
+            while futures:
+                done_futures, _ = wait(futures, timeout=0.5, return_when=FIRST_COMPLETED)
+                if not done_futures:
+                    _refresh_progress()
                     continue
 
-                completed += 1
-                if not hold_df.empty:
-                    all_hold.append(hold_df)
-                    fund_holdings_dict[code] = hold_df
-                    # 主线程追加到 crawl_partial（安全）
-                    st.session_state.crawl_partial.append(hold_df.to_dict('records'))
-                    fund_msg_placeholder.text(f"✅ {code} {name} 获取成功（{len(hold_df)} 条）")
-                else:
-                    error_log.append(code)
-                    fund_msg_placeholder.text(f"⚠️ {code} {name} 未获取到持仓")
+                for future in done_futures:
+                    original = futures.pop(future)
+                    _submit_next()
 
-                done_codes.add(code)
-                st.session_state.crawl_done_codes = done_codes
-                # 每完成一批（或每完成一个）更新 all_holdings 快照
-                if completed % max(1, max_workers) == 0 or completed == len(remaining):
-                    if all_hold:
-                        combined = normalize_holdings_df(pd.concat(all_hold, ignore_index=True)).drop_duplicates(
-                            subset=['基金代码', '个股代码']
+                    pos, code, name = original
+                    try:
+                        pos, code, name, hold_df = future.result()
+                    except Exception as e:
+                        completed += 1
+                        error_log.append(code)
+                        failed_codes.add(code)
+                        st.session_state.crawl_done_codes = done_codes
+                        st.session_state.crawl_failed_codes = failed_codes
+                        fund_msg_placeholder.text(f"⚠️ {code} {name} 任务异常: {str(e)[:80]}")
+                        _refresh_progress(force_snapshot=True)
+                        continue
+
+                    completed += 1
+                    if not hold_df.empty:
+                        new_hold_buffer.append(hold_df)
+                        if len(fund_holdings_dict) < 100 or code in fund_holdings_dict:
+                            fund_holdings_dict[code] = hold_df
+                        fund_msg_placeholder.text(f"✅ {code} {name} 获取成功（{len(hold_df)} 条）")
+                        done_codes.add(code)
+                        failed_codes.discard(code)
+                    else:
+                        error_log.append(code)
+                        failed_codes.add(code)
+                        fund_msg_placeholder.text(f"⚠️ {code} {name} 未获取到持仓")
+
+                    st.session_state.crawl_done_codes = done_codes
+                    st.session_state.crawl_failed_codes = failed_codes
+                    # 增量保存，避免几千只基金后频繁全量 concat 造成停滞。
+                    _refresh_progress(
+                        force_snapshot=(
+                            len(new_hold_buffer) >= 100
+                            or completed == pending_total
+                            or time.time() - st.session_state.crawl_last_flush_at >= 20
                         )
-                        st.session_state.all_holdings = combined
-                        st.session_state.fund_holdings_dict = fund_holdings_dict
-                status_placeholder.text(f"已完成 {len(done_codes)}/{total} | 本次 {completed}/{len(remaining)}")
-                progress_bar.progress(min(int(len(done_codes) / total * 100), 100))
+                    )
 
     # 最终合并与清理
-    if all_hold:
-        combined = normalize_holdings_df(pd.concat(all_hold, ignore_index=True)).drop_duplicates(
-            subset=['基金代码', '个股代码']
-        )
-        st.session_state.all_holdings = combined
-        st.session_state.fund_holdings_dict = fund_holdings_dict
-        # 爬取完成，清空断点续爬状态
-        st.session_state.crawl_done_codes = set()
-        st.session_state.crawl_partial = []
-        st.success(f"✅ 持仓获取完成！共 {len(combined)} 条记录，涉及 {combined['个股代码'].nunique()} 只个股")
+    _flush_new_holdings(force=True)
+    if not st.session_state.all_holdings.empty:
+        combined = st.session_state.all_holdings
+        remaining_after_run = total - len(done_codes)
+        if error_log or remaining_after_run > 0:
+            st.warning(
+                f"本次全量爬取已结束并保存当前数据：共 {len(combined)} 条记录，"
+                f"涉及 {combined['个股代码'].nunique()} 只个股。"
+                f"还有 {remaining_after_run} 只基金未成功完成，可再次点击全量重试失败项。"
+            )
+        else:
+            # 全部成功后清空断点续爬状态，保留可下载结果。
+            st.session_state.crawl_done_codes = set()
+            st.session_state.crawl_failed_codes = set()
+            st.session_state.crawl_task_signature = ''
+            st.session_state.crawl_partial = []
+            st.success(f"✅ 持仓获取完成！共 {len(combined)} 条记录，涉及 {combined['个股代码'].nunique()} 只个股")
         if error_log:
             st.warning(f"以下基金获取失败（共 {len(error_log)} 只）：{', '.join(error_log[:20])}"
                        + ("..." if len(error_log) > 20 else ""))
         st.dataframe(combined.head(100), use_container_width=True)
-        st.markdown("### 💾 下载所有基金持仓")
+        st.markdown("### 💾 下载当前已获取持仓")
         create_download_buttons(combined, "全部基金持仓汇总")
         if fund_holdings_dict:
-            st.markdown("### 💾 下载单只基金持仓")
-            selected_fund = st.selectbox(
-                "选择要下载的基金",
-                options=list(fund_holdings_dict.keys()),
-                format_func=lambda x: (
-                    f"{x} - {fund_holdings_dict[x]['基金名称'].iloc[0]}"
-                    if not fund_holdings_dict[x].empty else x
+            st.markdown("### 💾 单只基金持仓固定下载")
+            max_fund_downloads = 100
+            fund_items = list(fund_holdings_dict.items())
+            if len(fund_items) > max_fund_downloads:
+                st.caption(
+                    f"单只基金下载按钮较多，当前固定展示前 {max_fund_downloads} 只；"
+                    "完整数据请下载“全部基金持仓汇总”。"
                 )
-            )
-            if selected_fund:
-                create_download_buttons(fund_holdings_dict[selected_fund], f"基金_{selected_fund}_持仓")
+            for code, hold_df in fund_items[:max_fund_downloads]:
+                if hold_df.empty:
+                    continue
+                fund_name = hold_df['基金名称'].iloc[0] if '基金名称' in hold_df.columns else f"基金{code}"
+                with st.expander(f"{code} - {fund_name}（{len(hold_df)} 条）", expanded=False):
+                    create_download_buttons(hold_df, f"基金_{code}_持仓")
         return combined
 
-    st.error("所有基金均获取失败，请检查网络或更换爬取方式")
+    if remaining:
+        st.error("本次基金均获取失败，请调低并发数、增大请求抖动，或稍后再次点击全量重试。")
+    else:
+        st.info("没有需要处理的基金。")
     return pd.DataFrame()
 
 # ========================== 文件读取 ==========================
@@ -875,7 +1141,7 @@ def query_stock_fund_holdings():
         if has_code:
             return holdings_df[holdings_df['个股代码'] == query_code].copy()
         return holdings_df[
-            holdings_df['个股名称'].astype(str).str.contains(keyword, case=False, na=False)
+            holdings_df['个股名称'].astype(str).str.contains(keyword, case=False, na=False, regex=False)
         ].copy()
     col_query, col_button = st.columns([3, 1])
     with col_query:
@@ -896,15 +1162,21 @@ def query_stock_fund_holdings():
     query_code = normalize_stock_code(query)
     has_code = bool(re.search(r'\d', query)) and re.match(r'^\d{6}$', query_code)
     direct_result = pd.DataFrame()
+    cached_code_result = pd.DataFrame()
     if has_code:
         with st.spinner("正在按股票代码直接查询基金持股..."):
             direct_result = fetch_stock_fund_holdings_direct(query_code)
     if has_code and direct_result.empty:
-        st.warning(f"未在最新报告期基金持仓数据中找到「{query_code}」。")
-        st.caption("为避免历史持仓误报，股票代码直查不再回退到本地缓存。")
-        return
+        if not st.session_state.all_holdings.empty:
+            cached_code_result = _filter_stock_holdings(st.session_state.all_holdings, query_code)
+        if cached_code_result.empty:
+            st.warning(f"未在最新报告期基金持仓数据或当前缓存中找到「{query_code}」。")
+            return
+        st.info("最新报告期直查未返回结果，已改用当前缓存中的持仓数据。")
     if not direct_result.empty:
         result = direct_result.copy()
+    elif not cached_code_result.empty:
+        result = cached_code_result.copy()
     elif st.session_state.all_holdings.empty:
         st.info("当前没有基金持仓缓存，正在按侧边栏条件先抓取基金池和持仓数据。")
         with st.spinner("正在准备基金池..."):
@@ -979,7 +1251,11 @@ def render_feature_overview():
 def render_data_status():
     high_count = 0 if st.session_state.high_funds.empty else len(st.session_state.high_funds)
     holding_count = 0 if st.session_state.all_holdings.empty else len(st.session_state.all_holdings)
-    stock_count = 0 if st.session_state.all_holdings.empty else st.session_state.all_holdings['个股代码'].nunique()
+    stock_count = (
+        0
+        if st.session_state.all_holdings.empty or '个股代码' not in st.session_state.all_holdings.columns
+        else st.session_state.all_holdings['个股代码'].nunique()
+    )
     score_count = 0 if st.session_state.stock_scores.empty else len(st.session_state.stock_scores)
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("基金池", f"{high_count} 只")
@@ -993,10 +1269,11 @@ render_feature_overview()
 render_data_status()
 st.divider()
 st.header("基金持仓获取与分析")
-if st.session_state.crawl_done_codes:
+if st.session_state.crawl_done_codes or st.session_state.crawl_failed_codes:
     st.warning(
-        f"⚠️ 检测到未完成的爬取任务（已完成 {len(st.session_state.crawl_done_codes)} 只基金）。"
-        "点击「从爬取结果获取持仓」可继续；点击「清空所有数据」可重新开始。"
+        f"⚠️ 检测到未完成的爬取任务（已成功 {len(st.session_state.crawl_done_codes)} 只基金，"
+        f"待重试 {len(st.session_state.crawl_failed_codes)} 只）。"
+        "点击「一次性获取全部持仓」可继续处理全部剩余基金；点击「清空所有数据」可重新开始。"
     )
 tab_crawl, tab_import, tab_download, tab_stock_query = st.tabs([
     "📈 从涨幅基金爬取",
@@ -1017,7 +1294,7 @@ with tab_crawl:
             with st.spinner("爬取中..."):
                 crawl_high_return_funds()
     with col2:
-        if st.button("2️⃣ 从爬取结果获取持仓", type="primary", use_container_width=True):
+        if st.button("2️⃣ 一次性获取全部持仓", type="primary", use_container_width=True):
             if st.session_state.high_funds.empty:
                 st.error("请先执行步骤 1")
             else:
@@ -1077,7 +1354,10 @@ with col2:
         st.session_state.stock_scores = pd.DataFrame()
         st.session_state.fund_holdings_dict = {}
         st.session_state.crawl_done_codes = set()
+        st.session_state.crawl_failed_codes = set()
+        st.session_state.crawl_task_signature = ''
         st.session_state.crawl_partial = []
+        st.session_state.crawl_last_flush_at = 0.0
         st.success("已清空所有数据（含断点续爬记录）")
 with col3:
     if not st.session_state.all_holdings.empty or not st.session_state.stock_scores.empty:
@@ -1112,4 +1392,6 @@ if not st.session_state.stock_scores.empty:
                      use_container_width=True, hide_index=True)
         st.markdown("**💾 下载当前数据**")
         create_download_buttons(st.session_state.stock_scores[cols].head(TOP_N_STOCKS), "龙头股排行")
+st.divider()
+render_any_data_downloads("当前可下载数据")
 st.caption("v12 修复版 | 修复 AKShare 涨跌幅解析 & 多线程 session_state 安全隐患 | 断点续爬更稳定")
